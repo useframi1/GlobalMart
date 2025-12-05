@@ -1,0 +1,28 @@
+apiVersion: 1
+
+datasources:
+  # Prometheus - System metrics
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: "15s"
+
+  # PostgreSQL - Data warehouse
+  - name: PostgreSQL
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: globalmart_warehouse
+    user: globalmart_user
+    editable: true
+    jsonData:
+      sslmode: "disable"
+      maxOpenConns: 10
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+    secureJsonData:
+      password: CHANGE_ME_secure_password_123
