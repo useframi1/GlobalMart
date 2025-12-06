@@ -21,12 +21,12 @@ from stream_processing.jobs.inventory_tracker import InventoryTracker
 class StreamProcessingOrchestrator:
     """Orchestrates multiple stream processing jobs"""
 
-    def __init__(self, output_mode: str = "mongodb"):
+    def __init__(self, output_mode: str = "postgres"):
         """
         Initialize orchestrator
 
         Args:
-            output_mode: 'console' for testing, 'mongodb' for production
+            output_mode: 'console' for testing, 'postgres' for production
         """
         self.output_mode = output_mode
         self.jobs = {}
@@ -122,9 +122,9 @@ def main():
     parser = argparse.ArgumentParser(description="GlobalMart Stream Processing Orchestrator")
     parser.add_argument(
         "--mode",
-        choices=["console", "mongodb"],
-        default="mongodb",
-        help="Output mode: console for testing, mongodb for production (default: mongodb)"
+        choices=["console", "postgres"],
+        default="postgres",
+        help="Output mode: console for testing, postgres for production (default: postgres)"
     )
     parser.add_argument(
         "--jobs",

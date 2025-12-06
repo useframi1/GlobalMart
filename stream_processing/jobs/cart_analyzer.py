@@ -104,7 +104,8 @@ class CartAnalyzer:
                               col("last_activity"),
                               col("total_events"),
                               # Session completed if checkout occurred
-                              (col("checkout_count") > 0).alias("session_completed")
+                              (col("checkout_count") > 0).alias("session_completed"),
+                              current_timestamp().alias("created_at")
                           ))
 
         return session_metrics
@@ -140,7 +141,8 @@ class CartAnalyzer:
                       )
                       # Only abandoned carts: items added but no checkout
                       .filter((col("items_added") > 0) & (col("checkouts") == 0))
-                      .withColumn("abandonment_detected_at", current_timestamp()))
+                      .withColumn("abandonment_detected_at", current_timestamp())
+                      .withColumn("created_at", current_timestamp()))
 
         return abandonment
 
@@ -175,31 +177,35 @@ class CartAnalyzer:
                       # Calculate abandonment rate
                       when(col("adds") > 0,
                            (col("adds") - col("checkouts")) / col("adds") * 100)
-                      .otherwise(0).alias("abandonment_rate_pct")
+                      .otherwise(0).alias("abandonment_rate_pct"),
+                      current_timestamp().alias("created_at")
                   ))
 
         return metrics
 
-    def write_to_mongodb(self, df: DataFrame, collection_name: str, checkpoint_location: str):
-        """Write stream to MongoDB using foreachBatch"""
-        print(f"Writing to MongoDB collection: {collection_name}")
+    def write_to_postgres(self, df: DataFrame, table_name: str, checkpoint_location: str):
+        """Write stream to PostgreSQL Real-Time database using foreachBatch"""
+        print(f"Writing to PostgreSQL real-time table: {table_name}")
 
-        mongo_uri = settings.mongo.connection_string
-        mongo_database = settings.mongo.database
+        jdbc_url = settings.postgres_realtime.jdbc_url
+        db_user = settings.postgres_realtime.user
+        db_password = settings.postgres_realtime.password
 
         def process_batch(batch_df, batch_id):
-            """Process each micro-batch and write to MongoDB"""
+            """Process each micro-batch and write to PostgreSQL"""
             if batch_df.count() > 0:
-                # Write to MongoDB
+                # Write to PostgreSQL
                 (batch_df.write
-                 .format("mongodb")
+                 .format("jdbc")
+                 .option("url", jdbc_url)
+                 .option("dbtable", table_name)
+                 .option("user", db_user)
+                 .option("password", db_password)
+                 .option("driver", "org.postgresql.Driver")
                  .mode("append")
-                 .option("spark.mongodb.connection.uri", mongo_uri)
-                 .option("spark.mongodb.database", mongo_database)
-                 .option("spark.mongodb.collection", collection_name)
                  .save())
 
-                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {collection_name}")
+                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {table_name}")
 
         query = (df
                 .writeStream
@@ -228,7 +234,7 @@ class CartAnalyzer:
         Run the cart analyzer
 
         Args:
-            output_mode: 'console' for testing, 'mongodb' for production
+            output_mode: 'console' for testing, 'postgres' for production
         """
         print("=" * 60)
         print("Cart Events Analyzer Stream Processing")
@@ -252,18 +258,18 @@ class CartAnalyzer:
             query3 = self.write_to_console(cart_metrics, "cart_metrics")
             queries = [query1, query2, query3]
 
-        elif output_mode == "mongodb":
-            query1 = self.write_to_mongodb(
+        elif output_mode == "postgres":
+            query1 = self.write_to_postgres(
                 session_metrics,
                 "cart_sessions",
                 f"{settings.spark.checkpoint_dir}/cart_sessions"
             )
-            query2 = self.write_to_mongodb(
+            query2 = self.write_to_postgres(
                 abandoned_carts,
                 "abandoned_carts",
                 f"{settings.spark.checkpoint_dir}/abandoned_carts"
             )
-            query3 = self.write_to_mongodb(
+            query3 = self.write_to_postgres(
                 cart_metrics,
                 "cart_metrics",
                 f"{settings.spark.checkpoint_dir}/cart_metrics"

@@ -73,27 +73,12 @@ class AnomalyDetector:
 
     def detect_high_value_anomalies(self, transactions_df: DataFrame) -> DataFrame:
         """Detect transactions with unusually high values"""
-        # Calculate statistics in a sliding window
-        stats_df = (transactions_df
-                   .withWatermark("timestamp", "5 minutes")
-                   .groupBy(window(col("timestamp"), "5 minutes"))
-                   .agg(
-                       avg("total_amount").alias("avg_amount"),
-                       stddev("total_amount").alias("stddev_amount")
-                   )
-                   .select(
-                       col("window.start").alias("stats_window_start"),
-                       col("window.end").alias("stats_window_end"),
-                       col("avg_amount"),
-                       col("stddev_amount")
-                   ))
-
-        # Join transactions with statistics and detect anomalies
+        # Simplified: Use static threshold without complex windowed statistics
         # High-value anomaly threshold from constants
         high_value_threshold = ANOMALY_VALUE_RANGE[0]  # $3000+
 
         anomalies = (transactions_df
-                    .withWatermark("timestamp", "5 minutes")
+                    .withWatermark("timestamp", "1 minute")
                     .filter(col("total_amount") >= high_value_threshold)
                     .withColumn("anomaly_type", lit("high_value"))
                     .withColumn("anomaly_reason",
@@ -103,6 +88,7 @@ class AnomalyDetector:
                                .when(col("total_amount") >= (ANOMALY_VALUE_RANGE[0] + ANOMALY_VALUE_RANGE[1])/2, "high")
                                .otherwise("medium"))
                     .withColumn("detected_at", current_timestamp())
+                    .withColumn("created_at", current_timestamp())
                     .select(
                         col("transaction_id"),
                         col("user_id"),
@@ -113,7 +99,8 @@ class AnomalyDetector:
                         col("anomaly_type"),
                         col("anomaly_reason"),
                         col("severity"),
-                        col("detected_at")
+                        col("detected_at"),
+                        col("created_at")
                     ))
 
         return anomalies
@@ -124,7 +111,7 @@ class AnomalyDetector:
         high_quantity_threshold = ANOMALY_QUANTITY_RANGE[0]  # 50+ items
 
         exploded_df = (transactions_df
-                      .withWatermark("timestamp", "5 minutes")
+                      .withWatermark("timestamp", "1 minute")
                       .select(
                           col("transaction_id"),
                           col("user_id"),
@@ -145,6 +132,7 @@ class AnomalyDetector:
                                .when(col("product.quantity") >= (ANOMALY_QUANTITY_RANGE[0] + ANOMALY_QUANTITY_RANGE[1])/2, "high")
                                .otherwise("medium"))
                     .withColumn("detected_at", current_timestamp())
+                    .withColumn("created_at", current_timestamp())
                     .withColumn("product_id", col("product.product_id"))
                     .withColumn("quantity", col("product.quantity"))
                     .select(
@@ -159,19 +147,20 @@ class AnomalyDetector:
                         col("anomaly_type"),
                         col("anomaly_reason"),
                         col("severity"),
-                        col("detected_at")
+                        col("detected_at"),
+                        col("created_at")
                     ))
 
         return anomalies
 
     def detect_suspicious_patterns(self, transactions_df: DataFrame) -> DataFrame:
         """Detect suspicious transaction patterns (e.g., rapid repeated transactions)"""
-        # Detect users with multiple high-value transactions in short time
+        # Detect users with multiple high-value transactions in short time (1 minute)
         suspicious = (transactions_df
-                     .withWatermark("timestamp", "10 minutes")
+                     .withWatermark("timestamp", "1 minute")
                      .filter(col("total_amount") >= 1000)  # Only high-value transactions
                      .groupBy(
-                         window(col("timestamp"), "10 minutes"),
+                         window(col("timestamp"), "1 minute"),
                          col("user_id"),
                          col("country")
                      )
@@ -195,13 +184,14 @@ class AnomalyDetector:
                          col("first_transaction"),
                          col("last_transaction")
                      )
-                     # Suspicious if 3+ high-value transactions in 10 minutes
-                     .filter(col("transaction_count") >= 3)
+                     # Suspicious if 2+ high-value transactions in 1 minute (very rapid)
+                     .filter(col("transaction_count") >= 2)
                      .withColumn("anomaly_type", lit("suspicious_pattern"))
                      .withColumn("anomaly_reason",
-                                expr("concat(transaction_count, ' high-value transactions totaling $', round(total_spent, 2), ' in 10 minutes')"))
+                                expr("concat(transaction_count, ' high-value transactions totaling $', round(total_spent, 2), ' in 1 minute')"))
                      .withColumn("severity", lit("high"))
-                     .withColumn("detected_at", current_timestamp()))
+                     .withColumn("detected_at", current_timestamp())
+                     .withColumn("created_at", current_timestamp()))
 
         return suspicious
 
@@ -248,31 +238,35 @@ class AnomalyDetector:
                     col("high_quantity_count"),
                     col("critical_count"),
                     col("high_severity_count"),
-                    col("medium_severity_count")
+                    col("medium_severity_count"),
+                    current_timestamp().alias("created_at")
                 ))
 
         return stats
 
-    def write_to_mongodb(self, df: DataFrame, collection_name: str, checkpoint_location: str):
-        """Write stream to MongoDB using foreachBatch"""
-        print(f"Writing to MongoDB collection: {collection_name}")
+    def write_to_postgres(self, df: DataFrame, table_name: str, checkpoint_location: str):
+        """Write stream to PostgreSQL Real-Time database using foreachBatch"""
+        print(f"Writing to PostgreSQL real-time table: {table_name}")
 
-        mongo_uri = settings.mongo.connection_string
-        mongo_database = settings.mongo.database
+        jdbc_url = settings.postgres_realtime.jdbc_url
+        db_user = settings.postgres_realtime.user
+        db_password = settings.postgres_realtime.password
 
         def process_batch(batch_df, batch_id):
-            """Process each micro-batch and write to MongoDB"""
+            """Process each micro-batch and write to PostgreSQL"""
             if batch_df.count() > 0:
-                # Write to MongoDB
+                # Write to PostgreSQL
                 (batch_df.write
-                 .format("mongodb")
+                 .format("jdbc")
+                 .option("url", jdbc_url)
+                 .option("dbtable", table_name)
+                 .option("user", db_user)
+                 .option("password", db_password)
+                 .option("driver", "org.postgresql.Driver")
                  .mode("append")
-                 .option("spark.mongodb.connection.uri", mongo_uri)
-                 .option("spark.mongodb.database", mongo_database)
-                 .option("spark.mongodb.collection", collection_name)
                  .save())
 
-                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {collection_name}")
+                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {table_name}")
 
                 # Publish alerts to Kafka for critical anomalies (only if severity column exists)
                 if "severity" in batch_df.columns:
@@ -346,7 +340,7 @@ class AnomalyDetector:
         Run the anomaly detector
 
         Args:
-            output_mode: 'console' for testing, 'mongodb' for production
+            output_mode: 'console' for testing, 'postgres' for production
         """
         print("=" * 60)
         print("Transaction Anomaly Detector Stream Processing")
@@ -371,23 +365,23 @@ class AnomalyDetector:
             query3 = self.write_to_console(suspicious_patterns, "suspicious_patterns")
             queries = [query1, query2, query3]
 
-        elif output_mode == "mongodb":
-            query1 = self.write_to_mongodb(
+        elif output_mode == "postgres":
+            query1 = self.write_to_postgres(
                 high_value_anomalies,
                 "high_value_anomalies",
                 f"{settings.spark.checkpoint_dir}/high_value_anomalies"
             )
-            query2 = self.write_to_mongodb(
+            query2 = self.write_to_postgres(
                 high_quantity_anomalies,
                 "high_quantity_anomalies",
                 f"{settings.spark.checkpoint_dir}/high_quantity_anomalies"
             )
-            query3 = self.write_to_mongodb(
+            query3 = self.write_to_postgres(
                 suspicious_patterns,
                 "suspicious_patterns",
                 f"{settings.spark.checkpoint_dir}/suspicious_patterns"
             )
-            query4 = self.write_to_mongodb(
+            query4 = self.write_to_postgres(
                 anomaly_stats,
                 "anomaly_stats",
                 f"{settings.spark.checkpoint_dir}/anomaly_stats"

@@ -111,7 +111,8 @@ class ProductViewAnalyzer:
                        col("unique_viewers"),
                        col("avg_view_duration"),
                        col("product_price"),
-                       current_timestamp().alias("analyzed_at")
+                       current_timestamp().alias("analyzed_at"),
+                       current_timestamp().alias("created_at")
                    )
                    # Only products with significant activity
                    .filter(col("view_count") >= 5))
@@ -144,7 +145,8 @@ class ProductViewAnalyzer:
                                col("unique_users"),
                                col("unique_products"),
                                col("avg_view_duration"),
-                               col("avg_product_price")
+                               col("avg_product_price"),
+                               current_timestamp().alias("created_at")
                            ))
 
         return category_metrics
@@ -171,7 +173,8 @@ class ProductViewAnalyzer:
                              col("country"),
                              col("search_count"),
                              col("unique_searchers"),
-                             col("avg_results")  # ADDED
+                             col("avg_results"),  # ADDED
+                             current_timestamp().alias("created_at")
                          )
                          # Only popular searches
                          .filter(col("search_count") >= 3))
@@ -215,31 +218,35 @@ class ProductViewAnalyzer:
                               col("last_activity"),
                               col("total_events"),
                               # Calculate session duration in seconds
-                              (col("last_activity").cast("long") - col("first_activity").cast("long")).alias("session_duration_sec")
+                              (col("last_activity").cast("long") - col("first_activity").cast("long")).alias("session_duration_sec"),
+                              current_timestamp().alias("created_at")
                           ))
 
         return session_metrics
 
-    def write_to_mongodb(self, df: DataFrame, collection_name: str, checkpoint_location: str):
-        """Write stream to MongoDB using foreachBatch"""
-        print(f"Writing to MongoDB collection: {collection_name}")
+    def write_to_postgres(self, df: DataFrame, table_name: str, checkpoint_location: str):
+        """Write stream to PostgreSQL Real-Time database using foreachBatch"""
+        print(f"Writing to PostgreSQL real-time table: {table_name}")
 
-        mongo_uri = settings.mongo.connection_string
-        mongo_database = settings.mongo.database
+        jdbc_url = settings.postgres_realtime.jdbc_url
+        db_user = settings.postgres_realtime.user
+        db_password = settings.postgres_realtime.password
 
         def process_batch(batch_df, batch_id):
-            """Process each micro-batch and write to MongoDB"""
+            """Process each micro-batch and write to PostgreSQL"""
             if batch_df.count() > 0:
-                # Write to MongoDB
+                # Write to PostgreSQL
                 (batch_df.write
-                 .format("mongodb")
+                 .format("jdbc")
+                 .option("url", jdbc_url)
+                 .option("dbtable", table_name)
+                 .option("user", db_user)
+                 .option("password", db_password)
+                 .option("driver", "org.postgresql.Driver")
                  .mode("append")
-                 .option("spark.mongodb.connection.uri", mongo_uri)
-                 .option("spark.mongodb.database", mongo_database)
-                 .option("spark.mongodb.collection", collection_name)
                  .save())
 
-                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {collection_name}")
+                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {table_name}")
 
         query = (df
                 .writeStream
@@ -268,7 +275,7 @@ class ProductViewAnalyzer:
         Run the product view analyzer
 
         Args:
-            output_mode: 'console' for testing, 'mongodb' for production
+            output_mode: 'console' for testing, 'postgres' for production
         """
         print("=" * 60)
         print("Product View Analyzer Stream Processing")
@@ -294,23 +301,23 @@ class ProductViewAnalyzer:
             query4 = self.write_to_console(user_sessions, "user_sessions")
             queries = [query1, query2, query3, query4]
 
-        elif output_mode == "mongodb":
-            query1 = self.write_to_mongodb(
+        elif output_mode == "postgres":
+            query1 = self.write_to_postgres(
                 trending_products,
                 "trending_products",
                 f"{settings.spark.checkpoint_dir}/trending_products"
             )
-            query2 = self.write_to_mongodb(
+            query2 = self.write_to_postgres(
                 category_performance,
                 "category_performance",
                 f"{settings.spark.checkpoint_dir}/category_performance"
             )
-            query3 = self.write_to_mongodb(
+            query3 = self.write_to_postgres(
                 search_behavior,
                 "search_behavior",
                 f"{settings.spark.checkpoint_dir}/search_behavior"
             )
-            query4 = self.write_to_mongodb(
+            query4 = self.write_to_postgres(
                 user_sessions,
                 "browsing_sessions",
                 f"{settings.spark.checkpoint_dir}/browsing_sessions"

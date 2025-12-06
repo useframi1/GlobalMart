@@ -55,7 +55,7 @@ class TransactionGenerator:
     def get_current_hour_type(self, hour: int = None) -> str:
         """Determine if current hour is peak, normal, or low traffic"""
         if hour is None:
-            hour = datetime.now().hour
+            hour = datetime.utcnow().hour
 
         if hour in SHOPPING_HOURS['peak']:
             return 'peak'
@@ -95,7 +95,7 @@ class TransactionGenerator:
             transaction_id = str(uuid.uuid4())
 
         if timestamp is None:
-            timestamp = datetime.now()
+            timestamp = datetime.utcnow()
 
         # Select random user
         user = self.user_generator.get_random_user()

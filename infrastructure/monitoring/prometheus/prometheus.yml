@@ -8,6 +8,31 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
+  # Node Exporter - System metrics (CPU, Memory, Disk, Network)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # Kafka Exporter - Kafka broker and topic metrics
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
+  # PostgreSQL Warehouse Exporter
+  - job_name: 'postgres-warehouse'
+    static_configs:
+      - targets: ['postgres-exporter-warehouse:9187']
+
+  # PostgreSQL Real-time Exporter
+  - job_name: 'postgres-realtime'
+    static_configs:
+      - targets: ['postgres-exporter-realtime:9187']
+
+  # Redis Exporter
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
   # API metrics (when implemented)
   - job_name: 'globalmart-api'
     static_configs:

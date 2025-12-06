@@ -2,12 +2,15 @@
 Spark Session Factory for GlobalMart
 Provides configured Spark sessions for streaming and batch processing
 """
+
 import sys
 import os
 from pyspark.sql import SparkSession
 
 # Add project root to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.append(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 from config.settings import settings
 
@@ -26,20 +29,27 @@ def create_spark_session(app_name: str = None) -> SparkSession:
         app_name = settings.spark.app_name
 
     # Build Spark session
-    spark = (SparkSession.builder
-             .appName(app_name)
-             .master(settings.spark.master_url)
-             .config("spark.driver.memory", settings.spark.driver_memory)
-             .config("spark.executor.memory", settings.spark.executor_memory)
-             .config("spark.executor.cores", settings.spark.executor_cores)
-             .config("spark.sql.shuffle.partitions", "12")
-             .config("spark.streaming.stopGracefullyOnShutdown", "true")
-             # Kafka packages
-             .config("spark.jars.packages",
-                     "org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0,"
-                     "org.mongodb.spark:mongo-spark-connector_2.12:10.2.0,"
-                     "org.postgresql:postgresql:42.6.0")
-             .getOrCreate())
+    spark = (
+        SparkSession.builder.appName(app_name)
+        .master(settings.spark.master_url)
+        .config("spark.driver.memory", settings.spark.driver_memory)
+        .config("spark.executor.memory", settings.spark.executor_memory)
+        .config("spark.executor.cores", settings.spark.executor_cores)
+        .config("spark.sql.shuffle.partitions", "12")
+        .config("spark.streaming.stopGracefullyOnShutdown", "true")
+        # Timezone configuration - force UTC for consistency
+        .config("spark.sql.session.timeZone", "UTC")
+        # Set JVM timezone to UTC (affects current_timestamp())
+        .config("spark.driver.extraJavaOptions", "-Duser.timezone=UTC")
+        .config("spark.executor.extraJavaOptions", "-Duser.timezone=UTC")
+        # Kafka packages
+        .config(
+            "spark.jars.packages",
+            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.4.0,"
+            "org.postgresql:postgresql:42.6.0",
+        )
+        .getOrCreate()
+    )
 
     # Set log level
     spark.sparkContext.setLogLevel(settings.spark.log_level)
@@ -65,7 +75,9 @@ def create_streaming_session(app_name: str = None) -> SparkSession:
     spark = create_spark_session(app_name or "GlobalMart-Streaming")
 
     # Additional streaming configurations
-    spark.conf.set("spark.sql.streaming.checkpointLocation", settings.spark.checkpoint_dir)
+    spark.conf.set(
+        "spark.sql.streaming.checkpointLocation", settings.spark.checkpoint_dir
+    )
 
     return spark
 

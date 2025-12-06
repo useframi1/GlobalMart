@@ -75,16 +75,17 @@ class SalesAggregator:
                      .withWatermark("timestamp", "1 minute")
                      .groupBy(window(col("timestamp"), "1 minute"))
                      .agg(
-                         count("transaction_id").alias("transaction_count"),
+                         count("transaction_id").alias("total_transactions"),
                          spark_sum("total_amount").alias("total_revenue"),
-                         avg("total_amount").alias("avg_transaction_value")
+                         avg("total_amount").alias("avg_order_value")
                      )
                      .select(
                          col("window.start").alias("window_start"),
                          col("window.end").alias("window_end"),
-                         col("transaction_count"),
+                         col("total_transactions"),
                          col("total_revenue"),
-                         col("avg_transaction_value")
+                         col("avg_order_value"),
+                         current_timestamp().alias("created_at")
                      ))
 
         return aggregated
@@ -98,39 +99,45 @@ class SalesAggregator:
                          col("country")
                      )
                      .agg(
-                         count("transaction_id").alias("transaction_count"),
-                         spark_sum("total_amount").alias("total_revenue")
+                         count("transaction_id").alias("total_transactions"),
+                         spark_sum("total_amount").alias("total_revenue"),
+                         avg("total_amount").alias("avg_order_value")
                      )
                      .select(
                          col("window.start").alias("window_start"),
                          col("window.end").alias("window_end"),
                          col("country"),
-                         col("transaction_count"),
-                         col("total_revenue")
+                         col("total_transactions"),
+                         col("total_revenue"),
+                         col("avg_order_value"),
+                         current_timestamp().alias("created_at")
                      ))
 
         return aggregated
 
-    def write_to_mongodb(self, df: DataFrame, collection_name: str, checkpoint_location: str):
-        """Write stream to MongoDB using foreachBatch"""
-        print(f"Writing to MongoDB collection: {collection_name}")
+    def write_to_postgres(self, df: DataFrame, table_name: str, checkpoint_location: str):
+        """Write stream to PostgreSQL Real-Time database using foreachBatch"""
+        print(f"Writing to PostgreSQL real-time table: {table_name}")
 
-        mongo_uri = settings.mongo.connection_string
-        mongo_database = settings.mongo.database
+        jdbc_url = settings.postgres_realtime.jdbc_url
+        db_user = settings.postgres_realtime.user
+        db_password = settings.postgres_realtime.password
 
         def process_batch(batch_df, batch_id):
-            """Process each micro-batch and write to MongoDB"""
+            """Process each micro-batch and write to PostgreSQL"""
             if batch_df.count() > 0:
-                # Write to MongoDB
+                # Write to PostgreSQL
                 (batch_df.write
-                 .format("mongodb")
+                 .format("jdbc")
+                 .option("url", jdbc_url)
+                 .option("dbtable", table_name)
+                 .option("user", db_user)
+                 .option("password", db_password)
+                 .option("driver", "org.postgresql.Driver")
                  .mode("append")
-                 .option("spark.mongodb.connection.uri", mongo_uri)
-                 .option("spark.mongodb.database", mongo_database)
-                 .option("spark.mongodb.collection", collection_name)
                  .save())
 
-                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {collection_name}")
+                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {table_name}")
 
         query = (df
                 .writeStream
@@ -159,7 +166,7 @@ class SalesAggregator:
         Run the sales aggregator
 
         Args:
-            output_mode: 'console' for testing, 'mongodb' for production
+            output_mode: 'console' for testing, 'postgres' for production
         """
         print("=" * 60)
         print("Sales Aggregator Stream Processing")
@@ -183,13 +190,13 @@ class SalesAggregator:
             query2 = self.write_to_console(by_country, "country_aggregates")
             queries = [query1, query2]
 
-        elif output_mode == "mongodb":
-            query1 = self.write_to_mongodb(
+        elif output_mode == "postgres":
+            query1 = self.write_to_postgres(
                 per_minute,
                 "sales_per_minute",
                 f"{settings.spark.checkpoint_dir}/sales_per_minute"
             )
-            query2 = self.write_to_mongodb(
+            query2 = self.write_to_postgres(
                 by_country,
                 "sales_by_country",
                 f"{settings.spark.checkpoint_dir}/sales_by_country"

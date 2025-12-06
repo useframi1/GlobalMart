@@ -8,7 +8,7 @@ from pyspark.sql import DataFrame
 from pyspark.sql.functions import (
     from_json, col, window, count, sum as spark_sum, avg,
     current_timestamp, to_timestamp, when, lit, expr, explode,
-    max as spark_max, lag, struct
+    max as spark_max, lag, struct, approx_count_distinct
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, DoubleType,
@@ -91,22 +91,17 @@ class InventoryTracker:
                         )
                         .agg(
                             spark_sum("product.quantity").alias("units_sold"),
-                            count("transaction_id").alias("transaction_count"),
-                            avg("product.price").alias("avg_price"),
-                            spark_max("product.price").alias("current_price"),
-                            spark_sum(expr("product.quantity * product.price")).alias("revenue")
+                            spark_sum(expr("product.quantity * product.price")).alias("total_revenue"),
+                            avg("product.price").alias("avg_price")
                         )
                         .select(
                             col("window.start").alias("window_start"),
                             col("window.end").alias("window_end"),
                             col("product_id"),
                             col("units_sold"),
-                            col("transaction_count"),
+                            col("total_revenue"),
                             col("avg_price"),
-                            col("current_price"),
-                            col("revenue"),
-                            # Calculate units per minute
-                            (col("units_sold") / 5.0).alias("units_per_minute")
+                            current_timestamp().alias("created_at")
                         ))
 
         return product_sales
@@ -129,17 +124,16 @@ class InventoryTracker:
                                )
                                .agg(
                                    spark_sum("product.quantity").alias("units_sold"),
-                                   count("*").alias("transaction_count"),
-                                   avg("product.price").alias("avg_price")
+                                   spark_sum(expr("product.quantity * product.price")).alias("total_revenue")
                                )
                                .select(
                                    col("window.start").alias("window_start"),
                                    col("window.end").alias("window_end"),
-                                   col("country"),
                                    col("product_id"),
+                                   col("country"),
                                    col("units_sold"),
-                                   col("transaction_count"),
-                                   col("avg_price")
+                                   col("total_revenue"),
+                                   current_timestamp().alias("created_at")
                                ))
 
         return inventory_by_country
@@ -159,114 +153,145 @@ class InventoryTracker:
                           col("product.product_id").alias("product_id")
                       )
                       .agg(
-                          spark_sum("product.quantity").alias("total_quantity_sold"),
-                          count("*").alias("sale_count"),
-                          avg("product.price").alias("product_price")
+                          spark_sum("product.quantity").alias("units_sold"),
+                          spark_sum(expr("product.quantity * product.price")).alias("total_revenue")
                       )
                       .select(
                           col("window.start").alias("window_start"),
                           col("window.end").alias("window_end"),
                           col("product_id"),
-                          col("total_quantity_sold"),
-                          col("sale_count"),
-                          col("product_price"),
-                          # Sales velocity
-                          (col("total_quantity_sold") / 10.0).alias("units_per_minute")
+                          col("units_sold"),
+                          col("total_revenue")
                       )
                       # High demand threshold: 20+ units in 10 minutes
-                      .filter(col("total_quantity_sold") >= 20)
-                      .withColumn("alert_type", lit("high_demand"))
-                      .withColumn("alert_message",
-                                 expr("concat('High demand detected: ', total_quantity_sold, ' units sold in 10 minutes')"))
-                      .withColumn("priority",
-                                 when(col("total_quantity_sold") >= 50, "critical")
-                                 .when(col("total_quantity_sold") >= 30, "high")
+                      .filter(col("units_sold") >= 20)
+                      .withColumn("demand_level",
+                                 when(col("units_sold") >= 50, "critical")
+                                 .when(col("units_sold") >= 30, "high")
                                  .otherwise("medium"))
-                      .withColumn("detected_at", current_timestamp()))
+                      .withColumn("alert_generated_at", current_timestamp())
+                      .withColumn("created_at", current_timestamp())
+                      .select(
+                          col("window_start"),
+                          col("window_end"),
+                          col("product_id"),
+                          col("units_sold"),
+                          col("total_revenue"),
+                          col("demand_level"),
+                          col("alert_generated_at"),
+                          col("created_at")
+                      ))
 
         return high_demand
 
-    def generate_restock_alerts(self, product_sales: DataFrame) -> DataFrame:
-        """Generate restock alerts based on sales velocity"""
-        # This is a simplified alert system
-        # In production, you'd compare against actual inventory levels
-        restock_alerts = (product_sales
+    def generate_restock_alerts(self, transactions_df: DataFrame) -> DataFrame:
+        """Generate restock alerts based on sales velocity by country"""
+        # Track sales by product and country
+        exploded_df = (transactions_df
+                      .withWatermark("timestamp", "5 minutes")
+                      .select(
+                          col("timestamp"),
+                          col("country"),
+                          explode(col("products")).alias("product")
+                      ))
+
+        restock_alerts = (exploded_df
+                         .groupBy(
+                             window(col("timestamp"), "5 minutes"),
+                             col("country"),
+                             col("product.product_id").alias("product_id")
+                         )
+                         .agg(
+                             spark_sum("product.quantity").alias("units_sold")
+                         )
+                         .select(
+                             col("window.start").alias("window_start"),
+                             col("window.end").alias("window_end"),
+                             col("product_id"),
+                             col("country"),
+                             col("units_sold"),
+                             # Calculate sales rate per minute
+                             (col("units_sold") / 5.0).alias("sales_rate_per_min")
+                         )
                          # High sales velocity suggests potential stock issues
-                         .filter(col("units_per_minute") >= 1.0)  # 1+ unit per minute
-                         .withColumn("alert_type", lit("potential_low_stock"))
-                         .withColumn("alert_message",
-                                    expr("concat('High sales velocity: ', round(units_per_minute, 2), ' units/min. Check inventory levels.')"))
-                         .withColumn("priority",
-                                    when(col("units_per_minute") >= 3.0, "high")
-                                    .when(col("units_per_minute") >= 2.0, "medium")
+                         .filter(col("sales_rate_per_min") >= 1.0)  # 1+ unit per minute
+                         .withColumn("urgency",
+                                    when(col("sales_rate_per_min") >= 3.0, "high")
+                                    .when(col("sales_rate_per_min") >= 2.0, "medium")
                                     .otherwise("low"))
-                         .withColumn("detected_at", current_timestamp())
+                         .withColumn("alert_generated_at", current_timestamp())
+                         .withColumn("created_at", current_timestamp())
                          .select(
                              col("window_start"),
                              col("window_end"),
                              col("product_id"),
+                             col("country"),
                              col("units_sold"),
-                             col("units_per_minute"),
-                             col("current_price"),
-                             col("revenue"),
-                             col("alert_type"),
-                             col("alert_message"),
-                             col("priority"),
-                             col("detected_at")
+                             col("sales_rate_per_min"),
+                             col("urgency"),
+                             col("alert_generated_at"),
+                             col("created_at")
                          ))
 
         return restock_alerts
 
     def aggregate_inventory_metrics(self, transactions_df: DataFrame) -> DataFrame:
-        """Aggregate overall inventory consumption metrics"""
+        """Aggregate overall inventory consumption metrics by country"""
         exploded_df = (transactions_df
                       .withWatermark("timestamp", "1 minute")
                       .select(
                           col("timestamp"),
+                          col("country"),
                           explode(col("products")).alias("product")
                       ))
 
         metrics = (exploded_df
-                  .groupBy(window(col("timestamp"), "1 minute"))
+                  .groupBy(
+                      window(col("timestamp"), "1 minute"),
+                      col("country")
+                  )
                   .agg(
                       spark_sum("product.quantity").alias("total_units_sold"),
-                      count("*").alias("total_product_sales"),
-                      count(when(col("product.quantity") >= 10, 1)).alias("bulk_purchases"),
-                      avg("product.quantity").alias("avg_quantity_per_sale"),
-                      spark_sum(expr("product.quantity * product.price")).alias("total_product_revenue")
+                      approx_count_distinct("product.product_id").alias("unique_products_sold"),
+                      spark_sum(expr("product.quantity * product.price")).alias("total_revenue"),
+                      count(when(col("product.quantity") >= 10, 1)).alias("fast_moving_products")
                   )
                   .select(
                       col("window.start").alias("window_start"),
                       col("window.end").alias("window_end"),
+                      col("country"),
                       col("total_units_sold"),
-                      col("total_product_sales"),
-                      col("bulk_purchases"),
-                      col("avg_quantity_per_sale"),
-                      col("total_product_revenue")
+                      col("unique_products_sold"),
+                      col("total_revenue"),
+                      col("fast_moving_products"),
+                      current_timestamp().alias("created_at")
                   ))
 
         return metrics
 
-    def write_to_mongodb(self, df: DataFrame, collection_name: str, checkpoint_location: str):
-        """Write stream to MongoDB using foreachBatch"""
-        print(f"Writing to MongoDB collection: {collection_name}")
+    def write_to_postgres(self, df: DataFrame, table_name: str, checkpoint_location: str):
+        """Write stream to PostgreSQL Real-Time database using foreachBatch"""
+        print(f"Writing to PostgreSQL real-time table: {table_name}")
 
-        mongo_uri = settings.mongo.connection_string
-        mongo_database = settings.mongo.database
+        jdbc_url = settings.postgres_realtime.jdbc_url
+        db_user = settings.postgres_realtime.user
+        db_password = settings.postgres_realtime.password
 
         def process_batch(batch_df, batch_id):
-            """Process each micro-batch and write to MongoDB"""
+            """Process each micro-batch and write to PostgreSQL"""
             if batch_df.count() > 0:
-                # Write to MongoDB
+                # Write to PostgreSQL
                 (batch_df.write
-                 .format("mongodb")
+                 .format("jdbc")
+                 .option("url", jdbc_url)
+                 .option("dbtable", table_name)
+                 .option("user", db_user)
+                 .option("password", db_password)
+                 .option("driver", "org.postgresql.Driver")
                  .mode("append")
-                 .option("spark.mongodb.connection.uri", mongo_uri)
-                 .option("spark.mongodb.database", mongo_database)
-                 .option("spark.mongodb.collection", collection_name)
                  .save())
 
-                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {collection_name}")
+                print(f"[Batch {batch_id}] Wrote {batch_df.count()} records to {table_name}")
 
                 # Log high-priority alerts
                 if "priority" in batch_df.columns:
@@ -301,7 +326,7 @@ class InventoryTracker:
         Run the inventory tracker
 
         Args:
-            output_mode: 'console' for testing, 'mongodb' for production
+            output_mode: 'console' for testing, 'postgres' for production
         """
         print("=" * 60)
         print("Inventory Tracker Stream Processing")
@@ -315,7 +340,7 @@ class InventoryTracker:
         product_sales = self.track_product_sales(transactions_df)
         inventory_by_country = self.track_inventory_by_country(transactions_df)
         high_demand = self.detect_high_demand_products(transactions_df)
-        restock_alerts = self.generate_restock_alerts(product_sales)
+        restock_alerts = self.generate_restock_alerts(transactions_df)
         inventory_metrics = self.aggregate_inventory_metrics(transactions_df)
 
         # Write streams
@@ -327,28 +352,28 @@ class InventoryTracker:
             query3 = self.write_to_console(restock_alerts, "restock_alerts")
             queries = [query1, query2, query3]
 
-        elif output_mode == "mongodb":
-            query1 = self.write_to_mongodb(
+        elif output_mode == "postgres":
+            query1 = self.write_to_postgres(
                 product_sales,
                 "product_sales_velocity",
                 f"{settings.spark.checkpoint_dir}/product_sales_velocity"
             )
-            query2 = self.write_to_mongodb(
+            query2 = self.write_to_postgres(
                 inventory_by_country,
                 "inventory_by_country",
                 f"{settings.spark.checkpoint_dir}/inventory_by_country"
             )
-            query3 = self.write_to_mongodb(
+            query3 = self.write_to_postgres(
                 high_demand,
                 "high_demand_alerts",
                 f"{settings.spark.checkpoint_dir}/high_demand_alerts"
             )
-            query4 = self.write_to_mongodb(
+            query4 = self.write_to_postgres(
                 restock_alerts,
                 "restock_alerts",
                 f"{settings.spark.checkpoint_dir}/restock_alerts"
             )
-            query5 = self.write_to_mongodb(
+            query5 = self.write_to_postgres(
                 inventory_metrics,
                 "inventory_metrics",
                 f"{settings.spark.checkpoint_dir}/inventory_metrics"

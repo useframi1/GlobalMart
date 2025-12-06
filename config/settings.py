@@ -39,15 +39,36 @@ class SparkConfig:
         self.checkpoint_dir = os.getenv("SPARK_CHECKPOINT_DIR", "./data/checkpoints")
 
 
-class PostgresConfig:
-    """PostgreSQL configuration settings"""
+class PostgresWarehouseConfig:
+    """PostgreSQL Data Warehouse configuration settings (for batch processing)"""
 
     def __init__(self):
-        self.host = os.getenv("POSTGRES_HOST", "localhost")
-        self.port = int(os.getenv("POSTGRES_PORT", "5432"))
-        self.database = os.getenv("POSTGRES_DB", "globalmart_warehouse")
-        self.user = os.getenv("POSTGRES_USER", "globalmart_user")
-        self.password = os.getenv("POSTGRES_PASSWORD", "")
+        self.host = os.getenv("POSTGRES_WAREHOUSE_HOST", "localhost")
+        self.port = int(os.getenv("POSTGRES_WAREHOUSE_PORT", "5432"))
+        self.database = os.getenv("POSTGRES_WAREHOUSE_DB", "globalmart_warehouse")
+        self.user = os.getenv("POSTGRES_WAREHOUSE_USER", "globalmart_user")
+        self.password = os.getenv("POSTGRES_WAREHOUSE_PASSWORD", "")
+
+    @property
+    def connection_string(self) -> str:
+        """Returns PostgreSQL connection string"""
+        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
+
+    @property
+    def jdbc_url(self) -> str:
+        """Returns JDBC URL for Spark"""
+        return f"jdbc:postgresql://{self.host}:{self.port}/{self.database}"
+
+
+class PostgresRealtimeConfig:
+    """PostgreSQL Real-Time Analytics configuration settings (for stream processing)"""
+
+    def __init__(self):
+        self.host = os.getenv("POSTGRES_REALTIME_HOST", "localhost")
+        self.port = int(os.getenv("POSTGRES_REALTIME_PORT", "5432"))
+        self.database = os.getenv("POSTGRES_REALTIME_DB", "globalmart_realtime")
+        self.user = os.getenv("POSTGRES_REALTIME_USER", "globalmart_user")
+        self.password = os.getenv("POSTGRES_REALTIME_PASSWORD", "")
 
     @property
     def connection_string(self) -> str:
@@ -166,7 +187,9 @@ class Settings:
     def __init__(self):
         self.kafka = KafkaConfig()
         self.spark = SparkConfig()
-        self.postgres = PostgresConfig()
+        self.postgres_warehouse = PostgresWarehouseConfig()
+        self.postgres_realtime = PostgresRealtimeConfig()
+        self.postgres = self.postgres_warehouse  # Backward compatibility
         self.mongo = MongoConfig()
         self.redis = RedisConfig()
         self.api = APIConfig()

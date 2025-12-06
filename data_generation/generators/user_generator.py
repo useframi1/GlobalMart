@@ -54,7 +54,7 @@ class UserGenerator:
     def generate_registration_date(self) -> str:
         """Generate registration date (within last 5 years)"""
         days_ago = random.randint(0, 5 * 365)
-        reg_date = datetime.now() - timedelta(days=days_ago)
+        reg_date = datetime.utcnow() - timedelta(days=days_ago)
         return reg_date.isoformat()
 
     def generate_user(self, user_id: int) -> Dict:

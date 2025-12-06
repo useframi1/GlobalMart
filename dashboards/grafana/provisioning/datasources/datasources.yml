@@ -4,6 +4,7 @@ datasources:
   # Prometheus - System metrics
   - name: Prometheus
     type: prometheus
+    uid: prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true
@@ -12,12 +13,13 @@ datasources:
       timeInterval: "15s"
 
   # PostgreSQL - Data warehouse
-  - name: PostgreSQL
+  - name: PostgreSQL-Warehouse
     type: postgres
+    uid: postgres-warehouse
     access: proxy
-    url: postgres:5432
+    url: postgres-warehouse:5432
     database: globalmart_warehouse
-    user: globalmart_user
+    user: $POSTGRES_WAREHOUSE_USER
     editable: true
     jsonData:
       sslmode: "disable"
@@ -25,4 +27,22 @@ datasources:
       maxIdleConns: 2
       connMaxLifetime: 14400
     secureJsonData:
-      password: CHANGE_ME_secure_password_123
+      password: $POSTGRES_WAREHOUSE_PASSWORD
+
+  # PostgreSQL - Real-time analytics
+  - name: PostgreSQL-RealTime
+    type: postgres
+    uid: postgres-realtime
+    access: proxy
+    url: postgres-realtime:5432
+    database: globalmart_realtime
+    user: $POSTGRES_REALTIME_USER
+    editable: true
+    jsonData:
+      sslmode: "disable"
+      maxOpenConns: 20
+      maxIdleConns: 5
+      connMaxLifetime: 14400
+      timescaledb: false
+    secureJsonData:
+      password: $POSTGRES_REALTIME_PASSWORD
