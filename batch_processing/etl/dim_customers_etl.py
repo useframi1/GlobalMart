@@ -32,23 +32,19 @@ class CustomerDimensionETL(DimensionETL):
         # Read sales data from real-time DB to get customer transaction summary
         # Using sales_per_minute and sales_by_country tables
         try:
-            # For now, we'll read from a simple source
-            # In production, this would aggregate from sales tables
-            # Extract unique user_ids from data generation or create dummy data for testing
-
-            # Read user data if available, otherwise create empty DataFrame
-            # This is a simplified version - in production would join multiple sources
+            # Extract customer data from cart sessions which has user_id
+            # In production, this would combine cart and sales data
             query = """
-                (SELECT DISTINCT
+                (SELECT
                     user_id,
-                    country,
                     MIN(window_start) as first_transaction_date,
-                    MAX(window_start) as last_transaction_date,
-                    COUNT(*) as total_transactions,
-                    SUM(total_revenue) as total_spent,
-                    AVG(avg_order_value) as avg_order_value
-                FROM sales_by_country
-                GROUP BY user_id, country) as customer_data
+                    MAX(last_activity) as last_transaction_date,
+                    COUNT(DISTINCT session_id) as total_transactions,
+                    COALESCE(SUM(max_cart_value), 0) as total_spent,
+                    COALESCE(AVG(max_cart_value), 0) as avg_order_value
+                FROM cart_sessions
+                WHERE checkout_count > 0
+                GROUP BY user_id) as customer_data
             """
 
             df = (self.spark.read
@@ -66,12 +62,11 @@ class CustomerDimensionETL(DimensionETL):
             return df
 
         except Exception as e:
-            self.logger.warning(f"Could not extract from sales tables: {e}")
+            self.logger.warning(f"Could not extract from cart sessions: {e}")
             self.logger.info("Creating empty customer dimension")
             # Return empty DataFrame with correct schema
             return self.spark.createDataFrame([], """
                 user_id STRING,
-                country STRING,
                 first_transaction_date TIMESTAMP,
                 last_transaction_date TIMESTAMP,
                 total_transactions BIGINT,

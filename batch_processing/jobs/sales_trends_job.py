@@ -44,10 +44,9 @@ class SalesTrendsJob(BaseAnalyticsJob):
                 (SELECT
                     fs.transaction_timestamp,
                     fs.product_id,
-                    fs.category,
                     fs.total_revenue,
                     fs.quantity,
-                    dd.full_date,
+                    dd.date as full_date,
                     dd.year,
                     dd.quarter,
                     dd.month,
@@ -55,12 +54,10 @@ class SalesTrendsJob(BaseAnalyticsJob):
                     dd.week,
                     dd.day_of_week,
                     dd.day_name,
-                    dd.is_weekend,
-                    COALESCE(dc.country, 'Unknown') as country
+                    dd.is_weekend
                 FROM fact_sales fs
-                LEFT JOIN dim_date dd ON fs.date_key = dd.date_key
-                LEFT JOIN dim_customers dc ON fs.customer_sk = dc.customer_sk
-                WHERE dd.full_date IS NOT NULL) as sales_trends_data
+                LEFT JOIN dim_date dd ON fs.date_id = dd.date_id
+                WHERE dd.date IS NOT NULL) as sales_trends_data
             """
 
             df = (self.spark.read

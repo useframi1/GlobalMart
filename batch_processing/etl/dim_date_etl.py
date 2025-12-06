@@ -4,7 +4,7 @@ Pre-populates date dimension with calendar attributes
 """
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import (
-    col, year, quarter, month, dayofmonth, dayofweek,
+    col, year, quarter, month, dayofmonth, dayofweek, weekofyear,
     date_format, when, lit, to_date
 )
 from datetime import datetime, timedelta
@@ -61,7 +61,7 @@ class DateDimensionETL(DimensionETL):
             .withColumn("year", year(col("date")))
             .withColumn("quarter", quarter(col("date")))
             .withColumn("month", month(col("date")))
-            .withColumn("week", date_format(col("date"), "w").cast("int"))
+            .withColumn("week", weekofyear(col("date")))  # Use weekofyear function instead of date_format
             .withColumn("day", dayofmonth(col("date")))
             .withColumn("day_of_week", dayofweek(col("date")))
             .withColumn("day_name", date_format(col("date"), "EEEE"))

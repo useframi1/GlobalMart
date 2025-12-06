@@ -44,7 +44,6 @@ class CustomerSegmentsJob(BaseAnalyticsJob):
             query = """
                 (SELECT
                     dc.user_id,
-                    dc.country,
                     dc.first_transaction_date,
                     dc.last_transaction_date,
                     dc.total_transactions,

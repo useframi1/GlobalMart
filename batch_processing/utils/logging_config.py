@@ -6,7 +6,7 @@ import logging
 import os
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-
+from config.settings import settings
 
 def get_logger(job_name: str, log_level: str = "INFO") -> logging.Logger:
     """
@@ -28,7 +28,7 @@ def get_logger(job_name: str, log_level: str = "INFO") -> logging.Logger:
         return logger
 
     # Create logs directory if it doesn't exist
-    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs", "batch")
+    log_dir = settings.batch.LOG_DIR
     os.makedirs(log_dir, exist_ok=True)
 
     # Create formatters

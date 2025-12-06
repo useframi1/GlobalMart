@@ -13,9 +13,14 @@ from pyspark.sql import SparkSession
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from batch_processing import config
+# Import config from centralized settings
+from config.settings import settings
+from stream_processing.common.spark_session import create_spark_session
+config = settings.batch
+
 from batch_processing.utils.logging_config import get_logger
 from batch_processing.utils.report_generator import BatchJobReport
+from batch_processing.warehouse.schema_init import ensure_schema_initialized
 
 # Import ETL jobs
 from batch_processing.etl.dim_date_etl import DateDimensionETL
@@ -52,17 +57,18 @@ class BatchOrchestrator:
         """Initialize Spark session with configuration"""
         self.logger.info("Initializing Spark session")
 
-        spark = (SparkSession.builder
-                .appName(config.SPARK_APP_NAME)
-                .master(config.SPARK_MASTER)
-                .config("spark.driver.memory", config.SPARK_MEMORY)
-                .config("spark.executor.cores", config.SPARK_CORES)
-                .config("spark.sql.adaptive.enabled", "true")
-                .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-                .getOrCreate())
+        spark = create_spark_session(config.SPARK_APP_NAME)
 
         self.logger.info(f"Spark session initialized: {spark.version}")
         return spark
+
+    def ensure_warehouse_schema(self) -> None:
+        """Ensure warehouse schema is initialized"""
+        self.logger.info("Checking warehouse schema initialization")
+        try:
+            ensure_schema_initialized()
+        except Exception as e:
+            self.logger.warning(f"Schema initialization check completed with notes: {e}")
 
     def get_job_instance(self, job_name: str):
         """Create job instance based on job name"""
@@ -236,7 +242,6 @@ class BatchOrchestrator:
         Returns:
             int: Exit code (0 for success, 1 for failure)
         """
-        self.report.start()
 
         try:
             # Resolve job list
@@ -249,6 +254,10 @@ class BatchOrchestrator:
             self.logger.info(f"Full Reload: {'YES' if self.full_reload else 'NO (Incremental)'}")
             self.logger.info(f"Jobs to execute ({len(job_list)}): {', '.join(job_list)}")
             self.logger.info("="*80)
+
+            # Ensure warehouse schema is initialized
+            if not self.dry_run:
+                self.ensure_warehouse_schema()
 
             # Initialize Spark
             if not self.dry_run:

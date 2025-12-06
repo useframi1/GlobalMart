@@ -50,7 +50,8 @@ class ProductViewsFactETL(FactETL):
                     category,
                     product_price,
                     view_count,
-                    click_through_rate,
+                    unique_viewers,
+                    avg_view_duration,
                     created_at
                 FROM trending_products
                 WHERE {where_clause}) as view_data
@@ -78,6 +79,10 @@ class ProductViewsFactETL(FactETL):
                 product_id STRING,
                 product_name STRING,
                 category STRING,
+                product_price DOUBLE,
+                view_count BIGINT,
+                unique_viewers BIGINT,
+                avg_view_duration DOUBLE,
                 product_price DOUBLE,
                 view_count BIGINT,
                 click_through_rate DOUBLE,
@@ -111,7 +116,7 @@ class ProductViewsFactETL(FactETL):
             dim_date = (self.spark.read
                        .format("jdbc")
                        .option("url", self.warehouse_jdbc_url)
-                       .option("dbtable", "(SELECT date_key, full_date FROM dim_date) as dim_dt")
+                       .option("dbtable", "(SELECT date_id, date FROM dim_date) as dim_dt")
                        .option("user", self.warehouse_jdbc_props["user"])
                        .option("password", self.warehouse_jdbc_props["password"])
                        .option("driver", self.warehouse_jdbc_props["driver"])
@@ -127,9 +132,10 @@ class ProductViewsFactETL(FactETL):
         transformed = df
 
         if dim_products is not None:
+            # Use broadcast join for better performance
             transformed = transformed.join(
                 dim_products,
-                df.product_id == dim_products.product_id,
+                transformed.product_id == dim_products.product_id,
                 "left"
             ).drop(dim_products.product_id)
 
@@ -137,19 +143,16 @@ class ProductViewsFactETL(FactETL):
             # Join on date
             transformed = transformed.join(
                 dim_date,
-                col("view_timestamp").cast("date") == col("full_date"),
+                col("view_timestamp").cast("date") == col("date"),
                 "left"
-            ).drop("full_date")
+            ).drop("date")
 
         # Add derived metrics
         transformed = (transformed
             .withColumn("view_source", lit("web"))  # Would come from event data
             .withColumn("device_type", lit("desktop"))  # Would come from event data
-            .withColumn("conversion_flag",
-                when(col("click_through_rate") > 0.05, lit(True))
-                .otherwise(lit(False)))
-            .withColumn("engagement_score",
-                col("view_count") * col("click_through_rate"))
+            .withColumn("avg_view_duration_sec", col("avg_view_duration"))
+            .withColumn("engagement_score", col("view_count") * col("unique_viewers"))
             .withColumn("created_at", current_timestamp())
             .withColumn("updated_at", current_timestamp())
         )

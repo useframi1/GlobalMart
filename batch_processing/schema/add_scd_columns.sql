@@ -9,7 +9,8 @@
 \echo 'Updating dim_customers...'
 
 -- Drop existing primary key constraint (will use surrogate key instead)
-ALTER TABLE dim_customers DROP CONSTRAINT IF EXISTS dim_customers_pkey;
+-- Use CASCADE to drop dependent foreign keys
+ALTER TABLE dim_customers DROP CONSTRAINT IF EXISTS dim_customers_pkey CASCADE;
 
 -- Add surrogate key column (if not exists)
 DO $$
@@ -58,7 +59,8 @@ CREATE INDEX IF NOT EXISTS idx_dim_customers_current ON dim_customers(is_current
 \echo 'Updating dim_products...'
 
 -- Drop existing primary key constraint
-ALTER TABLE dim_products DROP CONSTRAINT IF EXISTS dim_products_pkey;
+-- Use CASCADE to drop dependent foreign keys
+ALTER TABLE dim_products DROP CONSTRAINT IF EXISTS dim_products_pkey CASCADE;
 
 -- Add surrogate key column (if not exists)
 DO $$

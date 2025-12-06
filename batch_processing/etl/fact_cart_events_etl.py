@@ -47,10 +47,11 @@ class CartEventsFactETL(FactETL):
                     window_start as event_timestamp,
                     session_id,
                     user_id,
-                    total_items,
-                    total_value,
-                    is_abandoned,
-                    session_duration_minutes,
+                    country,
+                    add_count + remove_count + update_count + checkout_count as total_events,
+                    max_cart_value,
+                    checkout_count > 0 as is_checkout,
+                    last_activity,
                     created_at
                 FROM cart_sessions
                 WHERE {where_clause}) as cart_data
@@ -77,7 +78,11 @@ class CartEventsFactETL(FactETL):
                 event_timestamp TIMESTAMP,
                 session_id STRING,
                 user_id STRING,
-                total_items BIGINT,
+                country STRING,
+                total_events BIGINT,
+                max_cart_value DOUBLE,
+                is_checkout BOOLEAN,
+                last_activity TIMESTAMP,
                 total_value DOUBLE,
                 is_abandoned BOOLEAN,
                 session_duration_minutes INTEGER,
@@ -111,7 +116,7 @@ class CartEventsFactETL(FactETL):
             dim_date = (self.spark.read
                        .format("jdbc")
                        .option("url", self.warehouse_jdbc_url)
-                       .option("dbtable", "(SELECT date_key, full_date FROM dim_date) as dim_dt")
+                       .option("dbtable", "(SELECT date_id, date FROM dim_date) as dim_dt")
                        .option("user", self.warehouse_jdbc_props["user"])
                        .option("password", self.warehouse_jdbc_props["password"])
                        .option("driver", self.warehouse_jdbc_props["driver"])
@@ -129,7 +134,7 @@ class CartEventsFactETL(FactETL):
         if dim_customers is not None:
             transformed = transformed.join(
                 dim_customers,
-                df.user_id == dim_customers.user_id,
+                transformed.user_id == dim_customers.user_id,
                 "left"
             ).drop(dim_customers.user_id)
 
@@ -137,21 +142,19 @@ class CartEventsFactETL(FactETL):
             # Join on date
             transformed = transformed.join(
                 dim_date,
-                col("event_timestamp").cast("date") == col("full_date"),
+                col("event_timestamp").cast("date") == col("date"),
                 "left"
-            ).drop("full_date")
+            ).drop("date")
 
         # Add derived metrics
         transformed = (transformed
             .withColumn("event_type",
-                when(col("is_abandoned") == True, lit("cart_abandoned"))
-                .otherwise(lit("cart_checkout")))
-            .withColumn("avg_item_value",
-                when(col("total_items") > 0, col("total_value") / col("total_items"))
-                .otherwise(0.0))
-            .withColumn("abandonment_value",
-                when(col("is_abandoned") == True, col("total_value"))
-                .otherwise(0.0))
+                when(col("is_checkout") == True, lit("cart_checkout"))
+                .otherwise(lit("cart_event")))
+            .withColumn("cart_value", col("max_cart_value"))
+            .withColumn("session_duration_sec",
+                when(col("last_activity").isNotNull(), lit(0))
+                .otherwise(lit(0)))
             .withColumn("created_at", current_timestamp())
             .withColumn("updated_at", current_timestamp())
         )

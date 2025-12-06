@@ -3,7 +3,7 @@ Sales Fact ETL with Incremental Loading
 Loads transaction-level sales data from real-time database
 """
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, lit, current_timestamp, to_timestamp
+from pyspark.sql.functions import col, lit, current_timestamp, to_timestamp, when
 from datetime import datetime, timedelta
 import sys
 import os
@@ -40,21 +40,17 @@ class SalesFactETL(FactETL):
             where_clause = f"window_start > '{last_load}'"
 
         try:
-            # Extract from sales_per_minute aggregated table
-            # This contains pre-aggregated sales by minute windows
+            # Extract from product_sales_velocity table
+            # This contains product-level sales data aggregated by window
             query = f"""
                 (SELECT
                     window_start as transaction_timestamp,
-                    user_id,
                     product_id,
-                    product_name,
-                    category,
-                    product_price,
-                    quantity,
+                    units_sold as quantity,
                     total_revenue,
-                    payment_method,
+                    avg_price as product_price,
                     created_at
-                FROM sales_per_minute
+                FROM product_sales_velocity
                 WHERE {where_clause}) as sales_data
             """
 
@@ -77,7 +73,6 @@ class SalesFactETL(FactETL):
             # Return empty DataFrame with correct schema
             return self.spark.createDataFrame([], """
                 transaction_timestamp TIMESTAMP,
-                user_id STRING,
                 product_id STRING,
                 product_name STRING,
                 category STRING,
@@ -101,16 +96,6 @@ class SalesFactETL(FactETL):
 
         # Read dimension tables to get surrogate keys
         try:
-            # Get customer surrogate keys (current records only)
-            dim_customers = (self.spark.read
-                           .format("jdbc")
-                           .option("url", self.warehouse_jdbc_url)
-                           .option("dbtable", "(SELECT customer_sk, user_id FROM dim_customers WHERE is_current = TRUE) as dim_cust")
-                           .option("user", self.warehouse_jdbc_props["user"])
-                           .option("password", self.warehouse_jdbc_props["password"])
-                           .option("driver", self.warehouse_jdbc_props["driver"])
-                           .load())
-
             # Get product surrogate keys (current records only)
             dim_products = (self.spark.read
                           .format("jdbc")
@@ -125,7 +110,7 @@ class SalesFactETL(FactETL):
             dim_date = (self.spark.read
                        .format("jdbc")
                        .option("url", self.warehouse_jdbc_url)
-                       .option("dbtable", "(SELECT date_key, full_date FROM dim_date) as dim_dt")
+                       .option("dbtable", "(SELECT date_id, date FROM dim_date) as dim_dt")
                        .option("user", self.warehouse_jdbc_props["user"])
                        .option("password", self.warehouse_jdbc_props["password"])
                        .option("driver", self.warehouse_jdbc_props["driver"])
@@ -134,24 +119,16 @@ class SalesFactETL(FactETL):
         except Exception as e:
             self.logger.error(f"Error reading dimension tables: {e}")
             self.logger.warning("Proceeding without dimension lookups - will use business keys only")
-            dim_customers = None
             dim_products = None
             dim_date = None
 
         # Join with dimensions to get surrogate keys
         transformed = df
 
-        if dim_customers is not None:
-            transformed = transformed.join(
-                dim_customers,
-                df.user_id == dim_customers.user_id,
-                "left"
-            ).drop(dim_customers.user_id)
-
         if dim_products is not None:
             transformed = transformed.join(
                 dim_products,
-                df.product_id == dim_products.product_id,
+                transformed.product_id == dim_products.product_id,
                 "left"
             ).drop(dim_products.product_id)
 
@@ -159,9 +136,9 @@ class SalesFactETL(FactETL):
             # Join on date (cast transaction timestamp to date)
             transformed = transformed.join(
                 dim_date,
-                col("transaction_timestamp").cast("date") == col("full_date"),
+                col("transaction_timestamp").cast("date") == col("date"),
                 "left"
-            ).drop("full_date")
+            ).drop("date")
 
         # Add derived metrics
         transformed = (transformed
