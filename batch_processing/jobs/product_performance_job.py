@@ -34,12 +34,13 @@ class ProductPerformanceJob(BaseAnalyticsJob):
 
     def extract(self) -> DataFrame:
         """
-        Extract sales and view data from warehouse for product analysis
+        Extract product data from warehouse
+        Join fact_sales with dim_products to get business keys
         """
         self.logger.info("Extracting product data from data warehouse")
 
         try:
-            # Read sales fact table
+            # Read fact_sales
             sales_df = (self.spark.read
                        .format("jdbc")
                        .option("url", self.warehouse_jdbc_url)
@@ -49,7 +50,27 @@ class ProductPerformanceJob(BaseAnalyticsJob):
                        .option("driver", self.warehouse_jdbc_props["driver"])
                        .load())
 
-            # Read product views fact table
+            # Read dim_products to get product_id and category
+            dim_products = (self.spark.read
+                           .format("jdbc")
+                           .option("url", self.warehouse_jdbc_url)
+                           .option("dbtable", "(SELECT product_id_pk, product_id, category, product_name FROM dim_products) as dim_prod")
+                           .option("user", self.warehouse_jdbc_props["user"])
+                           .option("password", self.warehouse_jdbc_props["password"])
+                           .option("driver", self.warehouse_jdbc_props["driver"])
+                           .load())
+
+            # Join to get business keys and select columns explicitly
+            sales_with_products = (sales_df
+                .join(dim_products, "product_id_pk", "left")
+                .select(
+                    sales_df["*"],
+                    dim_products["product_id"],
+                    dim_products["category"],
+                    dim_products["product_name"]
+                ))
+
+            # Read fact_product_views
             views_df = (self.spark.read
                        .format("jdbc")
                        .option("url", self.warehouse_jdbc_url)
@@ -59,25 +80,16 @@ class ProductPerformanceJob(BaseAnalyticsJob):
                        .option("driver", self.warehouse_jdbc_props["driver"])
                        .load())
 
-            self.stats["rows_processed"] = sales_df.count() + views_df.count()
-            self.logger.info(f"Extracted {sales_df.count()} sales and {views_df.count()} view records")
+            sales_count = sales_with_products.count()
+            views_count = views_df.count()
 
-            return {"sales": sales_df, "views": views_df}
+            self.logger.info(f"Extracted {sales_count} sales and {views_count} view records")
+
+            return {"sales": sales_with_products, "views": views_df}
 
         except Exception as e:
             self.logger.error(f"Error extracting product data: {e}")
-            # Return empty DataFrames
-            empty_sales = self.spark.createDataFrame([], """
-                product_id STRING,
-                category STRING,
-                quantity BIGINT,
-                total_revenue DOUBLE
-            """)
-            empty_views = self.spark.createDataFrame([], """
-                product_id STRING,
-                view_count BIGINT
-            """)
-            return {"sales": empty_sales, "views": empty_views}
+            raise
 
     def analyze(self, data: dict) -> DataFrame:
         """
@@ -115,10 +127,13 @@ class ProductPerformanceJob(BaseAnalyticsJob):
         # Step 1: Aggregate sales metrics by product
         self.logger.info("Step 1: Aggregating sales metrics")
 
-        sales_metrics = sales_df.groupBy("product_id", "category").agg(
+        # Filter out NULLs before aggregation
+        sales_clean = sales_df.filter(col("product_id").isNotNull() & col("category").isNotNull())
+
+        sales_metrics = sales_clean.groupBy("product_id", "category").agg(
             count("*").alias("total_sales"),
-            spark_sum("total_revenue").alias("total_revenue"),
-            avg("product_price").alias("avg_price"),
+            spark_sum("total_amount").alias("total_revenue"),
+            avg("unit_price").alias("avg_price"),
             spark_sum("quantity").alias("total_quantity")
         )
 
@@ -126,8 +141,20 @@ class ProductPerformanceJob(BaseAnalyticsJob):
         self.logger.info("Step 2: Aggregating view metrics")
 
         if views_df.count() > 0:
-            view_metrics = views_df.groupBy("product_id").agg(
-                spark_sum("view_count").alias("total_views")
+            # Join views with dim_products to get product_id
+            dim_products = (self.spark.read
+                           .format("jdbc")
+                           .option("url", self.warehouse_jdbc_url)
+                           .option("dbtable", "(SELECT product_id_pk, product_id FROM dim_products) as dim_prod")
+                           .option("user", self.warehouse_jdbc_props["user"])
+                           .option("password", self.warehouse_jdbc_props["password"])
+                           .option("driver", self.warehouse_jdbc_props["driver"])
+                           .load())
+
+            views_with_product = views_df.join(dim_products, "product_id_pk", "left")
+            
+            view_metrics = views_with_product.groupBy("product_id").agg(
+                count("*").alias("total_views")
             )
 
             # Join sales and views

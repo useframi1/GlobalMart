@@ -3,7 +3,7 @@ Product Views Fact ETL with Incremental Loading
 Loads product browsing/view events from real-time database
 """
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, lit, current_timestamp, when
+from pyspark.sql.functions import col, lit, current_timestamp, when, concat, monotonically_increasing_id
 from datetime import datetime
 import sys
 import os
@@ -100,13 +100,13 @@ class ProductViewsFactETL(FactETL):
             self.logger.info("No product views to transform")
             return df
 
-        # Read dimension tables to get surrogate keys
+        # Read dimension tables to get keys
         try:
-            # Get product surrogate keys (current records only)
+            # Get product primary keys
             dim_products = (self.spark.read
                           .format("jdbc")
                           .option("url", self.warehouse_jdbc_url)
-                          .option("dbtable", "(SELECT product_sk, product_id FROM dim_products WHERE is_current = TRUE) as dim_prod")
+                          .option("dbtable", "(SELECT product_id_pk, product_id FROM dim_products) as dim_prod")
                           .option("user", self.warehouse_jdbc_props["user"])
                           .option("password", self.warehouse_jdbc_props["password"])
                           .option("driver", self.warehouse_jdbc_props["driver"])
@@ -128,7 +128,7 @@ class ProductViewsFactETL(FactETL):
             dim_products = None
             dim_date = None
 
-        # Join with dimensions to get surrogate keys
+        # Join with dimensions to get keys
         transformed = df
 
         if dim_products is not None:
@@ -146,6 +146,21 @@ class ProductViewsFactETL(FactETL):
                 col("view_timestamp").cast("date") == col("date"),
                 "left"
             ).drop("date")
+
+        # Add default session_id if not present 
+        if "session_id" not in transformed.columns:
+            transformed = transformed.withColumn("session_id", 
+                concat(lit("view_session_"), monotonically_increasing_id()))
+
+        # Add event_type if not present
+        if "event_type" not in transformed.columns:
+            transformed = transformed.withColumn("event_type", lit("product_view"))
+
+        # Generate unique event_id
+        transformed = transformed.withColumn("event_id",
+            concat(lit("view_"), col("product_id"), lit("_"), monotonically_increasing_id()))
+        
+        transformed = transformed.withColumnRenamed("view_timestamp", "event_timestamp")
 
         # Add derived metrics
         transformed = (transformed
@@ -172,10 +187,8 @@ class ProductViewsFactETL(FactETL):
 
         # Select only columns that exist in target table
         columns_to_insert = [
-            "view_timestamp", "product_id", "product_sk", "date_key",
-            "product_name", "category", "product_price",
-            "view_count", "click_through_rate", "conversion_flag",
-            "engagement_score", "view_source", "device_type"
+            "event_id", "event_timestamp", "session_id", "event_type",
+            "product_id_pk", "date_id"
         ]
 
         # Filter to only existing columns

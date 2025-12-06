@@ -5,7 +5,7 @@ Analyzes customer segment distributions and characteristics
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import (
     col, count, sum as spark_sum, avg, max as spark_max, min as spark_min,
-    current_date, current_timestamp, lit
+    current_date, current_timestamp, lit, when
 )
 from datetime import datetime
 import sys
@@ -128,60 +128,44 @@ class CustomerSegmentsJob(BaseAnalyticsJob):
         ).withColumn("segment_type", lit("RFM"))\
          .withColumnRenamed("rfm_segment", "segment_name")
 
-        # Get primary country for each segment (most common country in that segment)
-        country_by_segment = df.filter(col("rfm_segment").isNotNull()).groupBy("rfm_segment", "country")\
-                               .agg(count("user_id").alias("country_count"))
+        # Add segment description based on segment_name
+        rfm_segments = rfm_segments.withColumn(
+            "segment_description",
+            when(col("segment_name") == "Champions", lit("Best customers - frequent buyers with high spend"))
+            .when(col("segment_name") == "Loyal Customers", lit("Consistent purchasers with good value"))
+            .when(col("segment_name") == "Potential Loyalists", lit("Recent customers showing promise"))
+            .when(col("segment_name") == "At Risk", lit("Previously valuable customers who haven't purchased recently"))
+            .when(col("segment_name") == "Can't Lose Them", lit("High-value customers at risk of churn"))
+            .otherwise(lit("Needs attention - low engagement or spend"))
+        )
 
-        window_spec = Window.partitionBy("rfm_segment").orderBy(col("country_count").desc())
-        primary_countries = country_by_segment.withColumn("rank", rank().over(window_spec))\
-                                             .filter(col("rank") == 1)\
-                                             .select(col("rfm_segment").alias("segment_name"),
-                                                    col("country").alias("primary_country"))
+        # Calculate min/max RFM scores for each segment (RFM scores are 111-555)
+        # Extract min and max from the segment's RFM scores
+        segment_score_ranges = df.filter(col("rfm_segment").isNotNull()).groupBy("rfm_segment").agg(
+            spark_min("rfm_score").alias("min_rfm_score"),
+            spark_max("rfm_score").alias("max_rfm_score")
+        ).withColumnRenamed("rfm_segment", "segment_name")
 
-        # Join primary countries
-        rfm_segments = rfm_segments.join(primary_countries, "segment_name", "left")
+        # Join score ranges
+        rfm_segments = rfm_segments.join(segment_score_ranges, "segment_name", "left")
 
-        # Also analyze by geographic segments (country)
-        self.logger.info("Analyzing geographic segments")
-
-        from pyspark.sql.window import Window
-        from pyspark.sql.functions import rank
-
-        geo_segments = df.groupBy("country").agg(
-            count("user_id").alias("customer_count"),
-            spark_sum("total_spent").alias("total_revenue"),
-            avg("total_spent").alias("avg_revenue_per_customer"),
-            spark_sum("total_transactions").alias("total_transactions"),
-            avg("total_transactions").alias("avg_transactions_per_customer"),
-            avg("avg_order_value").alias("avg_order_value"),
-            avg("recency_days").alias("avg_recency_days")
-        ).withColumn("segment_type", lit("Geographic"))\
-         .withColumnRenamed("country", "segment_name")\
-         .withColumn("primary_country", col("segment_name"))
-
-        # Combine both segment types
-        all_segments = rfm_segments.unionByName(geo_segments, allowMissingColumns=True)\
-                                   .withColumn("analysis_date", current_date())
-
-        # Select final columns
-        final_segments = all_segments.select(
-            "segment_name", "segment_type",
-            "customer_count", "total_revenue",
-            "avg_revenue_per_customer", "total_transactions",
-            "avg_transactions_per_customer", "avg_order_value",
-            "avg_recency_days", "primary_country",
-            "analysis_date"
+        # Select final columns matching table schema
+        final_segments = rfm_segments.select(
+            "segment_name",
+            "segment_description",
+            "min_rfm_score",
+            "max_rfm_score",
+            "customer_count",
+            "total_revenue",
+            "avg_order_value"
         )
 
         # Log segment statistics
-        segment_counts = final_segments.groupBy("segment_type").agg(
-            count("segment_name").alias("num_segments"),
-            spark_sum("customer_count").alias("total_customers")
-        ).collect()
+        segment_count = final_segments.count()
+        total_customers = final_segments.agg(spark_sum("customer_count")).collect()[0][0] or 0
 
         self.logger.info("Customer Segment Analysis Summary:")
-        for row in segment_counts:
-            self.logger.info(f"  {row['segment_type']}: {row['num_segments']} segments, {row['total_customers']} customers")
+        self.logger.info(f"  RFM: {segment_count} segments, {total_customers} customers")
 
         return final_segments
 

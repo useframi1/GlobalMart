@@ -3,7 +3,7 @@ Cart Events Fact ETL with Incremental Loading
 Loads cart interaction events from real-time database
 """
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, lit, current_timestamp, when
+from pyspark.sql.functions import col, lit, current_timestamp, when, concat, monotonically_increasing_id
 from datetime import datetime
 import sys
 import os
@@ -100,13 +100,13 @@ class CartEventsFactETL(FactETL):
             self.logger.info("No cart events to transform")
             return df
 
-        # Read dimension tables to get surrogate keys
+        # Read dimension tables to get keys
         try:
-            # Get customer surrogate keys (current records only)
+            # Get customer primary keys
             dim_customers = (self.spark.read
                            .format("jdbc")
                            .option("url", self.warehouse_jdbc_url)
-                           .option("dbtable", "(SELECT customer_sk, user_id FROM dim_customers WHERE is_current = TRUE) as dim_cust")
+                           .option("dbtable", "(SELECT customer_id, user_id FROM dim_customers) as dim_cust")
                            .option("user", self.warehouse_jdbc_props["user"])
                            .option("password", self.warehouse_jdbc_props["password"])
                            .option("driver", self.warehouse_jdbc_props["driver"])
@@ -128,7 +128,7 @@ class CartEventsFactETL(FactETL):
             dim_customers = None
             dim_date = None
 
-        # Join with dimensions to get surrogate keys
+        # Join with dimensions to get keys
         transformed = df
 
         if dim_customers is not None:
@@ -146,6 +146,10 @@ class CartEventsFactETL(FactETL):
                 "left"
             ).drop("date")
 
+        # Generate unique event_id
+        transformed = transformed.withColumn("event_id",
+            concat(lit("cart_"), col("session_id")))
+        
         # Add derived metrics
         transformed = (transformed
             .withColumn("event_type",
@@ -174,11 +178,8 @@ class CartEventsFactETL(FactETL):
 
         # Select only columns that exist in target table
         columns_to_insert = [
-            "event_timestamp", "session_id", "user_id",
-            "customer_sk", "date_key",
-            "event_type", "total_items", "total_value",
-            "avg_item_value", "is_abandoned", "abandonment_value",
-            "session_duration_minutes"
+            "event_id", "event_timestamp", "session_id", "customer_id", "date_id",
+            "event_type", "cart_value"
         ]
 
         # Filter to only existing columns

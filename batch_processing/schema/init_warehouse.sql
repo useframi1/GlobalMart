@@ -88,6 +88,7 @@ CREATE INDEX idx_dim_products_category ON dim_products(category);
 
 CREATE TABLE fact_sales (
     sale_id SERIAL PRIMARY KEY,
+    event_id VARCHAR(100) NOT NULL,
     transaction_id VARCHAR(100) NOT NULL,
     date_id INTEGER REFERENCES dim_date(date_id),
     customer_id INTEGER REFERENCES dim_customers(customer_id),
@@ -150,11 +151,10 @@ CREATE INDEX idx_fact_product_views_product ON fact_product_views(product_id_pk)
 
 CREATE TABLE rfm_analysis (
     rfm_id SERIAL PRIMARY KEY,
-    customer_id INTEGER REFERENCES dim_customers(customer_id),
     user_id VARCHAR(100) NOT NULL,
     analysis_date DATE NOT NULL,
     recency_days INTEGER NOT NULL,
-    frequency_count INTEGER NOT NULL,
+    frequency_count BIGINT NOT NULL,
     monetary_value DOUBLE PRECISION NOT NULL,
     recency_score INTEGER NOT NULL CHECK (recency_score BETWEEN 1 AND 5),
     frequency_score INTEGER NOT NULL CHECK (frequency_score BETWEEN 1 AND 5),
@@ -162,33 +162,35 @@ CREATE TABLE rfm_analysis (
     rfm_score INTEGER NOT NULL,
     rfm_segment VARCHAR(50) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(customer_id, analysis_date)
+    UNIQUE(user_id, analysis_date)
 );
 
-CREATE INDEX idx_rfm_analysis_customer ON rfm_analysis(customer_id);
+CREATE INDEX idx_rfm_analysis_user ON rfm_analysis(user_id);
 CREATE INDEX idx_rfm_analysis_segment ON rfm_analysis(rfm_segment);
 CREATE INDEX idx_rfm_analysis_date ON rfm_analysis(analysis_date);
 
 CREATE TABLE product_performance (
     performance_id SERIAL PRIMARY KEY,
-    product_id_pk INTEGER REFERENCES dim_products(product_id_pk),
     product_id VARCHAR(100) NOT NULL,
+    category VARCHAR(100),
     analysis_date DATE NOT NULL,
     total_sales BIGINT NOT NULL DEFAULT 0,
     total_revenue DOUBLE PRECISION NOT NULL DEFAULT 0,
+    total_quantity BIGINT NOT NULL DEFAULT 0,
     total_views BIGINT NOT NULL DEFAULT 0,
     conversion_rate DOUBLE PRECISION,
     avg_price DOUBLE PRECISION,
-    units_sold BIGINT NOT NULL DEFAULT 0,
-    cart_adds BIGINT NOT NULL DEFAULT 0,
-    cart_abandonment_rate DOUBLE PRECISION,
-    rank_in_category INTEGER,
+    category_rank INTEGER,
+    overall_rank INTEGER,
+    performance_score DOUBLE PRECISION,
+    performance_tier VARCHAR(50),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(product_id_pk, analysis_date)
+    UNIQUE(product_id, analysis_date)
 );
 
-CREATE INDEX idx_product_performance_product ON product_performance(product_id_pk);
+CREATE INDEX idx_product_performance_product ON product_performance(product_id);
 CREATE INDEX idx_product_performance_date ON product_performance(analysis_date);
+CREATE INDEX idx_product_performance_category ON product_performance(category);
 
 CREATE TABLE customer_segments (
     segment_id SERIAL PRIMARY KEY,
@@ -204,20 +206,22 @@ CREATE TABLE customer_segments (
 
 CREATE TABLE sales_trends (
     trend_id SERIAL PRIMARY KEY,
-    date_id INTEGER REFERENCES dim_date(date_id),
-    geography_id INTEGER REFERENCES dim_geography(geography_id),
+    period_type VARCHAR(20) NOT NULL,
+    period_value VARCHAR(50) NOT NULL,
     category VARCHAR(100),
     total_sales BIGINT NOT NULL DEFAULT 0,
     total_revenue DOUBLE PRECISION NOT NULL DEFAULT 0,
-    unique_customers BIGINT NOT NULL DEFAULT 0,
     avg_order_value DOUBLE PRECISION,
+    total_quantity BIGINT NOT NULL DEFAULT 0,
+    growth_rate DOUBLE PRECISION,
+    analysis_date DATE NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(date_id, geography_id, category)
+    UNIQUE(period_type, period_value, category)
 );
 
-CREATE INDEX idx_sales_trends_date ON sales_trends(date_id);
-CREATE INDEX idx_sales_trends_geography ON sales_trends(geography_id);
+CREATE INDEX idx_sales_trends_period ON sales_trends(period_type, period_value);
 CREATE INDEX idx_sales_trends_category ON sales_trends(category);
+CREATE INDEX idx_sales_trends_analysis_date ON sales_trends(analysis_date);
 
 -- ================== VIEWS ==================
 
@@ -236,16 +240,15 @@ ORDER BY dc.total_spent DESC;
 
 CREATE OR REPLACE VIEW v_top_products_by_revenue AS
 SELECT
-    dp.product_id,
-    dp.product_name,
-    dp.category,
+    pp.product_id,
+    pp.category,
     pp.total_sales,
     pp.total_revenue,
-    pp.units_sold,
+    pp.total_quantity,
     pp.conversion_rate,
+    pp.performance_tier,
     pp.analysis_date
 FROM product_performance pp
-JOIN dim_products dp ON pp.product_id_pk = dp.product_id_pk
 WHERE pp.analysis_date = (SELECT MAX(analysis_date) FROM product_performance)
 ORDER BY pp.total_revenue DESC
 LIMIT 100;

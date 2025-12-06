@@ -36,34 +36,53 @@ class RFMAnalysisJob(BaseAnalyticsJob):
 
     def extract(self) -> DataFrame:
         """
-        Extract sales data from warehouse for RFM analysis
+        Extract cart checkout events from warehouse for RFM analysis
+        Uses fact_cart_events with checkout events (which have customer info)
         """
-        self.logger.info("Extracting sales data from data warehouse")
+        self.logger.info("Extracting cart checkout events from data warehouse")
 
         try:
-            # Read sales fact table
-            sales_df = (self.spark.read
-                       .format("jdbc")
-                       .option("url", self.warehouse_jdbc_url)
-                       .option("dbtable", "fact_sales")
-                       .option("user", self.warehouse_jdbc_props["user"])
-                       .option("password", self.warehouse_jdbc_props["password"])
-                       .option("driver", self.warehouse_jdbc_props["driver"])
-                       .load())
+            # Read fact_cart_events (filter for checkout events only)
+            cart_df = (self.spark.read
+                      .format("jdbc")
+                      .option("url", self.warehouse_jdbc_url)
+                      .option("dbtable", "(SELECT * FROM fact_cart_events WHERE event_type = 'cart_checkout') as cart")
+                      .option("user", self.warehouse_jdbc_props["user"])
+                      .option("password", self.warehouse_jdbc_props["password"])
+                      .option("driver", self.warehouse_jdbc_props["driver"])
+                      .load())
 
-            self.stats["rows_processed"] = sales_df.count()
-            self.logger.info(f"Extracted {self.stats['rows_processed']} sales records for RFM analysis")
+            # Read dim_customers to get user_id
+            dim_customers = (self.spark.read
+                            .format("jdbc")
+                            .option("url", self.warehouse_jdbc_url)
+                            .option("dbtable", "(SELECT customer_id, user_id FROM dim_customers) as dim_cust")
+                            .option("user", self.warehouse_jdbc_props["user"])
+                            .option("password", self.warehouse_jdbc_props["password"])
+                            .option("driver", self.warehouse_jdbc_props["driver"])
+                            .load())
 
-            return sales_df
+            # Join to get user_id (left join, then filter NULLs)
+            events_with_customers = cart_df.join(dim_customers, "customer_id", "left")
+
+            # Filter out any rows where user_id or cart_value is null
+            events_with_customers = events_with_customers.filter(
+                col("user_id").isNotNull() & col("cart_value").isNotNull()
+            )
+
+            # Rename cart_value to total_amount and event_timestamp to transaction_timestamp for compatibility
+            events_with_customers = (events_with_customers
+                .withColumnRenamed("cart_value", "total_amount")
+                .withColumnRenamed("event_timestamp", "transaction_timestamp"))
+
+            count = events_with_customers.count()
+            self.logger.info(f"Extracted {count} cart checkout events for RFM analysis")
+
+            return events_with_customers
 
         except Exception as e:
-            self.logger.error(f"Error extracting sales data: {e}")
-            # Return empty DataFrame with minimal schema
-            return self.spark.createDataFrame([], """
-                user_id STRING,
-                transaction_timestamp TIMESTAMP,
-                total_revenue DOUBLE
-            """)
+            self.logger.error(f"Error extracting cart checkout data: {e}")
+            raise
 
     def analyze(self, df: DataFrame) -> DataFrame:
         """
@@ -105,8 +124,8 @@ class RFMAnalysisJob(BaseAnalyticsJob):
             # Frequency: Total number of transactions
             count("transaction_timestamp").alias("frequency_count"),
 
-            # Monetary: Total revenue
-            spark_sum("total_revenue").alias("monetary_value")
+            # Monetary: Total revenue (use total_amount, not total_revenue)
+            spark_sum("total_amount").alias("monetary_value")
         )
 
         # Step 2: Calculate quintile-based scores (1-5)
@@ -221,7 +240,7 @@ class RFMAnalysisJob(BaseAnalyticsJob):
             dim_customers = (self.spark.read
                            .format("jdbc")
                            .option("url", self.warehouse_jdbc_url)
-                           .option("dbtable", "(SELECT user_id, customer_segment, rfm_score FROM dim_customers WHERE is_current = TRUE) as dim_cust")
+                           .option("dbtable", "(SELECT user_id, customer_segment, rfm_score FROM dim_customers) as dim_cust")
                            .option("user", self.warehouse_jdbc_props["user"])
                            .option("password", self.warehouse_jdbc_props["password"])
                            .option("driver", self.warehouse_jdbc_props["driver"])
@@ -252,50 +271,14 @@ class RFMAnalysisJob(BaseAnalyticsJob):
                 with self.connection.get_warehouse_connection() as conn:
                     with conn.cursor() as cursor:
                         for row in updates_list:
-                            # Expire current record
+                            # Update customer record with new RFM data
                             cursor.execute("""
                                 UPDATE dim_customers
-                                SET effective_to = CURRENT_TIMESTAMP,
-                                    is_current = FALSE,
+                                SET customer_segment = %s,
+                                    rfm_score = %s,
                                     updated_at = CURRENT_TIMESTAMP
-                                WHERE user_id = %s AND is_current = TRUE
-                            """, (row["user_id"],))
-
-                            # Insert new version with updated RFM data
-                            cursor.execute("""
-                                INSERT INTO dim_customers (
-                                    user_id, country, first_transaction_date, last_transaction_date,
-                                    total_transactions, total_spent, avg_order_value,
-                                    customer_segment, rfm_score, is_active,
-                                    effective_from, effective_to, is_current,
-                                    created_at, updated_at, record_hash
-                                )
-                                SELECT
-                                    user_id, country, first_transaction_date, last_transaction_date,
-                                    total_transactions, total_spent, avg_order_value,
-                                    %s as customer_segment,
-                                    %s as rfm_score,
-                                    is_active,
-                                    CURRENT_TIMESTAMP as effective_from,
-                                    '9999-12-31 23:59:59'::TIMESTAMP as effective_to,
-                                    TRUE as is_current,
-                                    created_at,
-                                    CURRENT_TIMESTAMP as updated_at,
-                                    MD5(CONCAT_WS('|',
-                                        COALESCE(total_transactions::TEXT, ''),
-                                        COALESCE(total_spent::TEXT, ''),
-                                        COALESCE(avg_order_value::TEXT, ''),
-                                        COALESCE(%s, ''),
-                                        COALESCE(%s::TEXT, ''),
-                                        COALESCE(is_active::TEXT, '')
-                                    )) as record_hash
-                                FROM dim_customers
                                 WHERE user_id = %s
-                                  AND effective_to = CURRENT_TIMESTAMP
-                                  AND is_current = FALSE
                             """, (
-                                row["rfm_segment"],
-                                row["rfm_score"],
                                 row["rfm_segment"],
                                 row["rfm_score"],
                                 row["user_id"]

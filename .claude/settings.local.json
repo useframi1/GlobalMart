@@ -3,7 +3,11 @@
     "allow": [
       "Bash(tail:*)",
       "Bash(find:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(cp:*)",
+      "Bash(cat:*)",
+      "Bash(mv:*)",
+      "Bash(python main.py:*)"
     ],
     "deny": [],
     "ask": []

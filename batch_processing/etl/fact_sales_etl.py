@@ -3,7 +3,7 @@ Sales Fact ETL with Incremental Loading
 Loads transaction-level sales data from real-time database
 """
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, lit, current_timestamp, to_timestamp, when
+from pyspark.sql.functions import col, lit, current_timestamp, when, concat, monotonically_increasing_id
 from datetime import datetime, timedelta
 import sys
 import os
@@ -94,27 +94,27 @@ class SalesFactETL(FactETL):
             self.logger.info("No sales data to transform")
             return df
 
-        # Read dimension tables to get surrogate keys
+        # Read dimension tables to get keys
         try:
-            # Get product surrogate keys (current records only)
+            # Get product primary keys
             dim_products = (self.spark.read
-                          .format("jdbc")
-                          .option("url", self.warehouse_jdbc_url)
-                          .option("dbtable", "(SELECT product_sk, product_id FROM dim_products WHERE is_current = TRUE) as dim_prod")
-                          .option("user", self.warehouse_jdbc_props["user"])
-                          .option("password", self.warehouse_jdbc_props["password"])
-                          .option("driver", self.warehouse_jdbc_props["driver"])
-                          .load())
+                        .format("jdbc")
+                        .option("url", self.warehouse_jdbc_url)
+                        .option("dbtable", "(SELECT product_id_pk, product_id FROM dim_products) as dim_prod")
+                        .option("user", self.warehouse_jdbc_props["user"])
+                        .option("password", self.warehouse_jdbc_props["password"])
+                        .option("driver", self.warehouse_jdbc_props["driver"])
+                        .load())
 
             # Get date keys
             dim_date = (self.spark.read
-                       .format("jdbc")
-                       .option("url", self.warehouse_jdbc_url)
-                       .option("dbtable", "(SELECT date_id, date FROM dim_date) as dim_dt")
-                       .option("user", self.warehouse_jdbc_props["user"])
-                       .option("password", self.warehouse_jdbc_props["password"])
-                       .option("driver", self.warehouse_jdbc_props["driver"])
-                       .load())
+                    .format("jdbc")
+                    .option("url", self.warehouse_jdbc_url)
+                    .option("dbtable", "(SELECT date_id, date FROM dim_date) as dim_dt")
+                    .option("user", self.warehouse_jdbc_props["user"])
+                    .option("password", self.warehouse_jdbc_props["password"])
+                    .option("driver", self.warehouse_jdbc_props["driver"])
+                    .load())
 
         except Exception as e:
             self.logger.error(f"Error reading dimension tables: {e}")
@@ -122,7 +122,7 @@ class SalesFactETL(FactETL):
             dim_products = None
             dim_date = None
 
-        # Join with dimensions to get surrogate keys
+        # Join with dimensions to get keys
         transformed = df
 
         if dim_products is not None:
@@ -140,17 +140,27 @@ class SalesFactETL(FactETL):
                 "left"
             ).drop("date")
 
-        # Add derived metrics
+        # Rename columns to match warehouse schema
+        transformed = transformed.withColumnRenamed("total_revenue", "total_amount")
+        transformed = transformed.withColumnRenamed("product_price", "unit_price")
+        
+        # Generate unique event_id using product_id (the string)
+        transformed = transformed.withColumn("event_id",
+            concat(lit("sale_"), col("product_id"), lit("_"), monotonically_increasing_id().cast("string")))
+        
+        # Generate transaction_id
+        transformed = transformed.withColumn("transaction_id",
+            concat(lit("txn_"), col("transaction_timestamp").cast("string"), lit("_"), monotonically_increasing_id().cast("string")))
+        
+        # Add derived metrics 
         transformed = (transformed
-            .withColumn("discount_amount", lit(0.0))  # Would come from promotions
-            .withColumn("tax_amount", col("total_revenue") * 0.08)  # Simplified 8% tax
-            .withColumn("net_revenue", col("total_revenue") - col("discount_amount"))
+            .withColumn("discount_amount", lit(0.0))
+            .withColumn("tax_amount", col("total_amount") * 0.08)
+            .withColumn("net_revenue", col("total_amount") - col("discount_amount"))
             .withColumn("profit_margin",
-                when(col("product_price") > 0,
-                     (col("total_revenue") * 0.4) / col("product_price"))
+                when(col("unit_price") > 0,
+                    (col("total_amount") * 0.4) / col("unit_price"))
                 .otherwise(0.0))
-            .withColumn("created_at", current_timestamp())
-            .withColumn("updated_at", current_timestamp())
         )
 
         return transformed
@@ -169,12 +179,8 @@ class SalesFactETL(FactETL):
         # Select only columns that exist in target table
         # Exclude created_at from source to avoid conflict
         columns_to_insert = [
-            "transaction_timestamp", "user_id", "product_id",
-            "customer_sk", "product_sk", "date_key",
-            "product_name", "category", "product_price",
-            "quantity", "total_revenue", "discount_amount",
-            "tax_amount", "net_revenue", "payment_method",
-            "profit_margin"
+            "event_id", "transaction_id", "transaction_timestamp", "product_id_pk", "date_id",
+            "quantity", "unit_price", "total_amount", "discount_amount"
         ]
 
         # Filter to only existing columns
