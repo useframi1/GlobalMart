@@ -53,6 +53,8 @@ data/checkpoints/*
 !data/processed/.gitkeep
 !data/warehouse/.gitkeep
 !data/checkpoints/.gitkeep
+data_generation/data/*
+stream_processing/data/*
 
 # Logs
 logs/
