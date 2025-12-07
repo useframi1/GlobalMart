@@ -4,6 +4,9 @@
 -- Run: psql -U globalmart_user -d globalmart_realtime -f stream_processing/schema/init_realtime.sql
 
 -- Drop existing tables (if any)
+DROP TABLE IF EXISTS transactions CASCADE;
+DROP TABLE IF EXISTS product_view_events CASCADE;
+DROP TABLE IF EXISTS cart_events CASCADE;
 DROP TABLE IF EXISTS sales_per_minute CASCADE;
 DROP TABLE IF EXISTS sales_by_country CASCADE;
 DROP TABLE IF EXISTS cart_sessions CASCADE;
@@ -24,6 +27,69 @@ DROP TABLE IF EXISTS restock_alerts CASCADE;
 DROP TABLE IF EXISTS inventory_metrics CASCADE;
 
 -- ================== SALES AGGREGATOR TABLES ==================
+
+-- Raw transactions table for batch processing ETL
+-- Stores individual transaction line items from Kafka stream
+CREATE TABLE transactions (
+    transaction_id VARCHAR(100) NOT NULL,
+    line_item_id VARCHAR(100) PRIMARY KEY,
+    user_id VARCHAR(100) NOT NULL,
+    product_id VARCHAR(100) NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit_price DOUBLE PRECISION NOT NULL,
+    total_amount DOUBLE PRECISION NOT NULL,
+    discount_amount DOUBLE PRECISION DEFAULT 0,
+    payment_method VARCHAR(50),
+    country VARCHAR(100) NOT NULL,
+    transaction_timestamp TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_transactions_transaction_id ON transactions(transaction_id);
+CREATE INDEX idx_transactions_user ON transactions(user_id);
+CREATE INDEX idx_transactions_product ON transactions(product_id);
+CREATE INDEX idx_transactions_country ON transactions(country);
+CREATE INDEX idx_transactions_timestamp ON transactions(transaction_timestamp);
+
+-- Raw product view events table for batch processing ETL
+-- Stores individual product view events from Kafka stream
+CREATE TABLE product_view_events (
+    event_id VARCHAR(100) PRIMARY KEY,
+    event_type VARCHAR(50) NOT NULL,
+    user_id VARCHAR(100) NOT NULL,
+    session_id VARCHAR(100) NOT NULL,
+    product_id VARCHAR(100),
+    event_timestamp TIMESTAMP NOT NULL,
+    view_duration INTEGER,
+    search_query VARCHAR(255),
+    country VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_product_view_events_user ON product_view_events(user_id);
+CREATE INDEX idx_product_view_events_session ON product_view_events(session_id);
+CREATE INDEX idx_product_view_events_product ON product_view_events(product_id);
+CREATE INDEX idx_product_view_events_timestamp ON product_view_events(event_timestamp);
+
+-- Raw cart events table for batch processing ETL
+-- Stores individual cart events from Kafka stream
+CREATE TABLE cart_events (
+    event_id VARCHAR(100) PRIMARY KEY,
+    event_type VARCHAR(50) NOT NULL,
+    user_id VARCHAR(100) NOT NULL,
+    session_id VARCHAR(100) NOT NULL,
+    product_id VARCHAR(100),
+    event_timestamp TIMESTAMP NOT NULL,
+    quantity INTEGER,
+    cart_value DOUBLE PRECISION,
+    country VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_cart_events_user ON cart_events(user_id);
+CREATE INDEX idx_cart_events_session ON cart_events(session_id);
+CREATE INDEX idx_cart_events_product ON cart_events(product_id);
+CREATE INDEX idx_cart_events_timestamp ON cart_events(event_timestamp);
 
 CREATE TABLE sales_per_minute (
     window_start TIMESTAMP NOT NULL,

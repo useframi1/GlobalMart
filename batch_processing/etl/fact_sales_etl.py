@@ -1,209 +1,157 @@
 """
-Sales Fact ETL with Incremental Loading
-Loads transaction-level sales data from real-time database
+Fact Sales ETL
+Populates fact_sales table with transaction data from real-time database
 """
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, lit, current_timestamp, when, concat, monotonically_increasing_id
-from datetime import datetime, timedelta
 import sys
 import os
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import (
+    col, expr, lit, current_timestamp, to_date, monotonically_increasing_id
+)
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from batch_processing.etl.base_etl import FactETL
+from batch_processing.etl.base_etl import BaseETL
 
 
-class SalesFactETL(FactETL):
-    """ETL for sales fact table with incremental loading"""
+class FactSalesETL(BaseETL):
+    """ETL job for populating fact_sales table from real-time transactions"""
 
-    def __init__(self, spark):
-        super().__init__(spark, "fact_sales")
+    def __init__(self, batch_date: str = None):
+        """
+        Initialize FactSalesETL
+
+        Args:
+            batch_date: Date to process (YYYY-MM-DD), defaults to yesterday
+        """
+        super().__init__("FactSales")
+        self.batch_date = batch_date
 
     def extract(self) -> DataFrame:
         """
-        Extract sales data from real-time database
-        Uses incremental loading based on last run timestamp
+        Extract transaction line items from real-time transactions table
+
+        Returns:
+            DataFrame: Transaction line items from real-time database
         """
-        self.logger.info("Extracting sales data from real-time database")
+        # Read transaction line items from real-time database
+        df = self.read_from_postgres(table_name="transactions", database="realtime")
 
-        # Get last load timestamp for incremental processing
-        last_load = self.get_last_load_timestamp()
-
-        if last_load is None:
-            # First run - load all historical data
-            self.logger.info("First run - loading all historical sales data")
-            where_clause = "1=1"
+        # Filter for recent data (last 7 days if batch_date not specified)
+        from pyspark.sql.functions import current_date, date_sub
+        if self.batch_date is None:
+            df = df.filter(col("transaction_timestamp") >= date_sub(current_date(), 7))
         else:
-            # Incremental load - only new data
-            self.logger.info(f"Incremental load - data since {last_load}")
-            where_clause = f"window_start > '{last_load}'"
+            # Filter for specific batch date
+            df = df.filter(col("transaction_timestamp").cast("date") == self.batch_date)
 
-        try:
-            # Extract from product_sales_velocity table
-            # This contains product-level sales data aggregated by window
-            query = f"""
-                (SELECT
-                    window_start as transaction_timestamp,
-                    product_id,
-                    units_sold as quantity,
-                    total_revenue,
-                    avg_price as product_price,
-                    created_at
-                FROM product_sales_velocity
-                WHERE {where_clause}) as sales_data
-            """
+        df = df.orderBy(col("transaction_timestamp").desc())
 
-            df = (self.spark.read
-                  .format("jdbc")
-                  .option("url", self.realtime_jdbc_url)
-                  .option("dbtable", query)
-                  .option("user", self.realtime_jdbc_props["user"])
-                  .option("password", self.realtime_jdbc_props["password"])
-                  .option("driver", self.realtime_jdbc_props["driver"])
-                  .load())
-
-            self.stats["rows_processed"] = df.count()
-            self.logger.info(f"Extracted {self.stats['rows_processed']} sales records")
-
-            return df
-
-        except Exception as e:
-            self.logger.error(f"Error extracting sales data: {e}")
-            # Return empty DataFrame with correct schema
-            return self.spark.createDataFrame([], """
-                transaction_timestamp TIMESTAMP,
-                product_id STRING,
-                product_name STRING,
-                category STRING,
-                product_price DOUBLE,
-                quantity BIGINT,
-                total_revenue DOUBLE,
-                payment_method STRING,
-                created_at TIMESTAMP
-            """)
+        return df
 
     def transform(self, df: DataFrame) -> DataFrame:
         """
-        Transform sales data
-        Add surrogate key lookups and derived metrics
+        Transform transaction line items to fact table format
+        Maps to dimension tables using lookup joins
+
+        Args:
+            df: Input DataFrame with transaction line items
+
+        Returns:
+            DataFrame: Transformed fact sales data ready for warehouse
         """
-        self.logger.info("Transforming sales fact data")
+        # Read dimension tables for lookups
+        # For SCD Type 2 dimensions, filter for current records only
+        dim_customers = self.read_from_warehouse(table_name="dim_customers").filter(col("is_current") == True)
+        dim_products = self.read_from_warehouse(table_name="dim_products").filter(col("is_current") == True)
+        dim_geography = self.read_from_warehouse(table_name="dim_geography").filter(col("is_current") == True)
+        dim_date = self.read_from_warehouse(table_name="dim_date")
 
-        if df.count() == 0:
-            self.logger.info("No sales data to transform")
-            return df
-
-        # Read dimension tables to get keys
-        try:
-            # Get product primary keys
-            dim_products = (self.spark.read
-                        .format("jdbc")
-                        .option("url", self.warehouse_jdbc_url)
-                        .option("dbtable", "(SELECT product_id_pk, product_id FROM dim_products) as dim_prod")
-                        .option("user", self.warehouse_jdbc_props["user"])
-                        .option("password", self.warehouse_jdbc_props["password"])
-                        .option("driver", self.warehouse_jdbc_props["driver"])
-                        .load())
-
-            # Get date keys
-            dim_date = (self.spark.read
-                    .format("jdbc")
-                    .option("url", self.warehouse_jdbc_url)
-                    .option("dbtable", "(SELECT date_id, date FROM dim_date) as dim_dt")
-                    .option("user", self.warehouse_jdbc_props["user"])
-                    .option("password", self.warehouse_jdbc_props["password"])
-                    .option("driver", self.warehouse_jdbc_props["driver"])
-                    .load())
-
-        except Exception as e:
-            self.logger.error(f"Error reading dimension tables: {e}")
-            self.logger.warning("Proceeding without dimension lookups - will use business keys only")
-            dim_products = None
-            dim_date = None
-
-        # Join with dimensions to get keys
-        transformed = df
-
-        if dim_products is not None:
-            transformed = transformed.join(
-                dim_products,
-                transformed.product_id == dim_products.product_id,
+        # Join with dimension tables to get surrogate keys
+        # Left join to handle cases where dimension data might be missing
+        transformed_df = df.alias("t") \
+            .join(
+                dim_customers.select("customer_id", "user_id").alias("c"),
+                col("t.user_id") == col("c.user_id"),
                 "left"
-            ).drop(dim_products.product_id)
-
-        if dim_date is not None:
-            # Join on date (cast transaction timestamp to date)
-            transformed = transformed.join(
-                dim_date,
-                col("transaction_timestamp").cast("date") == col("date"),
+            ) \
+            .join(
+                dim_products.select("product_id_pk", "product_id").alias("p"),
+                col("t.product_id") == col("p.product_id"),
                 "left"
-            ).drop("date")
+            ) \
+            .join(
+                dim_geography.select("geography_id", "country").alias("g"),
+                col("t.country") == col("g.country"),
+                "left"
+            ) \
+            .join(
+                dim_date.select("date_id", "date").alias("d"),
+                col("t.transaction_timestamp").cast("date") == col("d.date"),
+                "left"
+            ) \
+            .select(
+                col("t.line_item_id").alias("event_id"),
+                col("t.transaction_id"),
+                col("d.date_id"),
+                col("c.customer_id"),
+                col("p.product_id_pk"),
+                col("g.geography_id"),
+                col("t.transaction_timestamp"),
+                col("t.quantity"),
+                col("t.unit_price"),
+                col("t.total_amount"),
+                col("t.discount_amount"),
+                col("t.payment_method")
+            )
 
-        # Rename columns to match warehouse schema
-        transformed = transformed.withColumnRenamed("total_revenue", "total_amount")
-        transformed = transformed.withColumnRenamed("product_price", "unit_price")
-        
-        # Generate unique event_id using product_id (the string)
-        transformed = transformed.withColumn("event_id",
-            concat(lit("sale_"), col("product_id"), lit("_"), monotonically_increasing_id().cast("string")))
-        
-        # Generate transaction_id
-        transformed = transformed.withColumn("transaction_id",
-            concat(lit("txn_"), col("transaction_timestamp").cast("string"), lit("_"), monotonically_increasing_id().cast("string")))
-        
-        # Add derived metrics 
-        transformed = (transformed
-            .withColumn("discount_amount", lit(0.0))
-            .withColumn("tax_amount", col("total_amount") * 0.08)
-            .withColumn("net_revenue", col("total_amount") - col("discount_amount"))
-            .withColumn("profit_margin",
-                when(col("unit_price") > 0,
-                    (col("total_amount") * 0.4) / col("unit_price"))
-                .otherwise(0.0))
-        )
-
-        return transformed
+        return transformed_df
 
     def load(self, df: DataFrame) -> None:
         """
-        Load sales facts to warehouse
-        Appends new records (facts are immutable)
-        """
-        self.logger.info("Loading sales fact data to warehouse")
+        Load fact sales data to warehouse with deduplication
 
+        Args:
+            df: Transformed DataFrame
+        """
         if df.count() == 0:
-            self.logger.info("No sales data to load")
+            print("  No sales data to load for this period")
             return
 
-        # Select only columns that exist in target table
-        # Exclude created_at from source to avoid conflict
-        columns_to_insert = [
-            "event_id", "transaction_id", "transaction_timestamp", "product_id_pk", "date_id",
-            "quantity", "unit_price", "total_amount", "discount_amount"
-        ]
-
-        # Filter to only existing columns
-        available_columns = [c for c in columns_to_insert if c in df.columns]
-        df_to_load = df.select(available_columns)
-
+        # Read existing fact_sales to check for duplicates
         try:
-            # Append to fact table (facts are insert-only, no updates)
-            (df_to_load.write
-             .format("jdbc")
-             .option("url", self.warehouse_jdbc_url)
-             .option("dbtable", "fact_sales")
-             .option("user", self.warehouse_jdbc_props["user"])
-             .option("password", self.warehouse_jdbc_props["password"])
-             .option("driver", self.warehouse_jdbc_props["driver"])
-             .mode("append")
-             .save())
+            existing_sales = self.read_from_warehouse("fact_sales")
+            existing_event_ids = existing_sales.select("event_id").distinct()
 
-            self.stats["rows_inserted"] = df_to_load.count()
-            self.stats["rows_updated"] = 0  # Facts are immutable
+            # Filter out records that already exist (based on event_id which is line_item_id)
+            new_sales = df.join(
+                existing_event_ids,
+                df.event_id == existing_event_ids.event_id,
+                "left_anti"
+            )
 
-            self.logger.info(f"Loaded {self.stats['rows_inserted']} sales records to warehouse")
+            new_count = new_sales.count()
+            duplicate_count = df.count() - new_count
+
+            if duplicate_count > 0:
+                print(f"  Skipping {duplicate_count} duplicate records")
+
+            if new_count > 0:
+                self.write_to_warehouse(new_sales, "fact_sales", mode="append")
+                print(f"  Loaded {new_count} new sales records to fact_sales")
+            else:
+                print("  No new sales records to load (all records already exist)")
 
         except Exception as e:
-            self.logger.error(f"Error loading sales data: {e}")
-            raise
+            # If fact_sales doesn't exist or is empty, load all records
+            print(f"  Note: {str(e)}")
+            print(f"  Loading all {df.count()} records to fact_sales")
+            self.write_to_warehouse(df, "fact_sales", mode="append")
+            print(f"  Loaded {df.count()} sales records to fact_sales")
+
+
+if __name__ == "__main__":
+    # Run FactSales ETL
+    etl = FactSalesETL()
+    etl.run()

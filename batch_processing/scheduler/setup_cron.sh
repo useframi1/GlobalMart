@@ -1,165 +1,78 @@
 #!/bin/bash
-###############################################################################
-# GlobalMart Cron Setup Script
-# Installs cron job for daily batch processing
-#
-# Usage: ./setup_cron.sh [--uninstall]
-###############################################################################
+# Setup Cron Job for Batch Processing
+# This script configures a cron job to run batch processing
+# TESTING MODE: Runs every 5 minutes
 
-set -e
+# Get the script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BATCH_SCRIPT="$SCRIPT_DIR/run_daily_batch.sh"
 
-# Configuration
-PROJECT_DIR="/mnt/c/Users/nadin/OneDrive/Desktop/GlobalMart"
-SCRIPT_PATH="${PROJECT_DIR}/batch_processing/scheduler/run_batch_jobs.sh"
-CRON_SCHEDULE="0 2 * * *"  # Daily at 2 AM UTC
-LOG_DIR="/var/log/globalmart"
+echo "=========================================="
+echo "GlobalMart Batch Processing Cron Setup"
+echo "=========================================="
+echo ""
 
-# Colors for output
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m' # No Color
+# Check if batch script exists
+if [ ! -f "$BATCH_SCRIPT" ]; then
+    echo "✗ Error: Batch script not found at $BATCH_SCRIPT"
+    exit 1
+fi
 
-# Logging functions
-info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
+# Make sure batch script is executable
+chmod +x "$BATCH_SCRIPT"
 
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
+echo "Batch script: $BATCH_SCRIPT"
+echo ""
 
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+# Create cron job entry (runs every 5 minutes for testing)
+# Production: 0 2 * * * (daily at 2 AM UTC)
+CRON_ENTRY="*/5 * * * * $BATCH_SCRIPT >> /tmp/globalmart_batch_cron.log 2>&1"
 
-# Check if running in WSL
-check_wsl() {
-    if ! grep -qi microsoft /proc/version; then
-        error "This script must be run in WSL (Windows Subsystem for Linux)"
-        exit 1
-    fi
-    info "Running in WSL environment"
-}
+echo "Proposed cron job:"
+echo "  $CRON_ENTRY"
+echo ""
+echo "⚠️  TESTING MODE: This will run batch processing every 5 minutes"
+echo "For production, change to: 0 2 * * * (daily at 2 AM UTC)"
+echo ""
 
-# Check if script is executable
-make_executable() {
-    if [ ! -x "$SCRIPT_PATH" ]; then
-        info "Making run_batch_jobs.sh executable..."
-        chmod +x "$SCRIPT_PATH"
-    fi
-    info "Script is executable: $SCRIPT_PATH"
-}
-
-# Create log directory
-setup_log_directory() {
-    if [ ! -d "$LOG_DIR" ]; then
-        info "Creating log directory: $LOG_DIR"
-        sudo mkdir -p "$LOG_DIR"
-        sudo chown $USER:$USER "$LOG_DIR"
-    else
-        info "Log directory exists: $LOG_DIR"
-    fi
-}
-
-# Check if cron is installed and running
-check_cron() {
-    if ! command -v cron &> /dev/null; then
-        error "Cron is not installed. Installing cron..."
-        sudo apt-get update
-        sudo apt-get install -y cron
-    fi
-
-    # Start cron service if not running
-    if ! service cron status &> /dev/null; then
-        info "Starting cron service..."
-        sudo service cron start
-    fi
-
-    info "Cron service is running"
-}
-
-# Install cron job
-install_cron() {
-    info "Installing cron job..."
-
-    # Check if cron job already exists
-    if crontab -l 2>/dev/null | grep -q "run_batch_jobs.sh"; then
-        warn "Cron job already exists. Removing old entry..."
-        crontab -l 2>/dev/null | grep -v "run_batch_jobs.sh" | crontab -
-    fi
-
-    # Add new cron job
-    (crontab -l 2>/dev/null; echo "# GlobalMart Batch Processing") | crontab -
-    (crontab -l 2>/dev/null; echo "$CRON_SCHEDULE $SCRIPT_PATH >> $LOG_DIR/cron.log 2>&1") | crontab -
-
-    info "Cron job installed successfully"
-}
-
-# Uninstall cron job
-uninstall_cron() {
-    info "Uninstalling cron job..."
-
-    if crontab -l 2>/dev/null | grep -q "run_batch_jobs.sh"; then
-        crontab -l 2>/dev/null | grep -v "run_batch_jobs.sh" | grep -v "# GlobalMart Batch Processing" | crontab -
-        info "Cron job removed successfully"
-    else
-        warn "No cron job found to remove"
-    fi
-}
-
-# Display current cron jobs
-show_cron() {
+# Check if cron job already exists
+if crontab -l 2>/dev/null | grep -q "$BATCH_SCRIPT"; then
+    echo "⚠ Cron job for batch processing already exists"
     echo ""
-    info "Current cron jobs for user $USER:"
-    echo "-----------------------------------"
-    crontab -l 2>/dev/null || echo "(no cron jobs)"
-    echo "-----------------------------------"
+    echo "Current cron jobs:"
+    crontab -l | grep "$BATCH_SCRIPT"
     echo ""
-}
-
-# Main execution
-main() {
+    read -p "Do you want to replace it? (y/n) " -n 1 -r
     echo ""
-    echo "=========================================="
-    echo "  GlobalMart Cron Setup"
-    echo "=========================================="
-    echo ""
-
-    # Check for uninstall flag
-    if [ "$1" == "--uninstall" ]; then
-        check_wsl
-        uninstall_cron
-        show_cron
-        info "Uninstall complete"
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Setup cancelled"
         exit 0
     fi
 
-    # Normal installation
-    check_wsl
-    check_cron
-    make_executable
-    setup_log_directory
-    install_cron
-    show_cron
+    # Remove existing cron job
+    crontab -l | grep -v "$BATCH_SCRIPT" | crontab -
+    echo "✓ Removed existing cron job"
+fi
 
-    echo ""
-    echo "=========================================="
-    echo "  Installation Summary"
-    echo "=========================================="
-    info "Schedule: $CRON_SCHEDULE (Daily at 2:00 AM UTC)"
-    info "Script: $SCRIPT_PATH"
-    info "Logs: $LOG_DIR/"
-    echo ""
-    info "To verify cron is working:"
-    echo "  1. Check cron service: service cron status"
-    echo "  2. View cron logs: cat $LOG_DIR/cron.log"
-    echo "  3. Test manually: $SCRIPT_PATH --dry-run"
-    echo ""
-    info "To uninstall: $0 --uninstall"
-    echo ""
-    echo -e "${GREEN}Setup complete!${NC}"
-    echo ""
-}
+# Add new cron job
+(crontab -l 2>/dev/null; echo "$CRON_ENTRY") | crontab -
 
-main "$@"
+if [ $? -eq 0 ]; then
+    echo ""
+    echo "✓ Cron job successfully installed"
+    echo ""
+    echo "Current cron jobs:"
+    crontab -l | grep "$BATCH_SCRIPT"
+    echo ""
+    echo "To view all cron jobs: crontab -l"
+    echo "To remove this cron job: crontab -e (then delete the line)"
+    echo ""
+    echo "Note: Make sure your system timezone is set correctly!"
+else
+    echo "✗ Failed to install cron job"
+    exit 1
+fi
+
+echo "=========================================="
+echo "Setup Complete"
+echo "=========================================="

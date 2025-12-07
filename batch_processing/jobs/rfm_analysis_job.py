@@ -1,295 +1,207 @@
 """
-RFM Analysis Job
-Segments customers based on Recency, Frequency, and Monetary value
+RFM (Recency, Frequency, Monetary) Analysis Batch Job
+Segments customers based on transaction behavior
 """
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import (
-    col, count, sum as spark_sum, max as spark_max, min as spark_min,
-    datediff, current_date, ntile, expr, when, lit, current_timestamp
-)
-from pyspark.sql.window import Window
-from datetime import datetime
 import sys
 import os
+from datetime import datetime
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import (
+    col, max as spark_max, count, sum as spark_sum,
+    datediff, lit, current_date, when, expr
+)
+from pyspark.sql.window import Window
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from batch_processing.jobs.base_job import BaseAnalyticsJob
+from batch_processing.jobs.base_job import BaseBatchJob
 
 
-class RFMAnalysisJob(BaseAnalyticsJob):
-    """
-    RFM (Recency, Frequency, Monetary) Analysis Job
+class RFMAnalysisJob(BaseBatchJob):
+    """RFM Analysis job for customer segmentation"""
 
-    Segments customers based on:
-    - Recency: Days since last transaction
-    - Frequency: Total number of transactions
-    - Monetary: Total amount spent
-
-    Uses quintile-based scoring (1-5 scale) to create composite RFM score
-    and segment classifications.
-    """
-
-    def __init__(self, spark):
-        super().__init__(spark, "rfm_analysis")
-
-    def extract(self) -> DataFrame:
+    def __init__(self, analysis_date: str = None):
         """
-        Extract cart checkout events from warehouse for RFM analysis
-        Uses fact_cart_events with checkout events (which have customer info)
+        Initialize RFM Analysis job
+
+        Args:
+            analysis_date: Date of analysis (YYYY-MM-DD), defaults to today
         """
-        self.logger.info("Extracting cart checkout events from data warehouse")
+        super().__init__("RFM_Analysis")
+        self.analysis_date = analysis_date or datetime.utcnow().strftime("%Y-%m-%d")
 
-        try:
-            # Read fact_cart_events (filter for checkout events only)
-            cart_df = (self.spark.read
-                      .format("jdbc")
-                      .option("url", self.warehouse_jdbc_url)
-                      .option("dbtable", "(SELECT * FROM fact_cart_events WHERE event_type = 'cart_checkout') as cart")
-                      .option("user", self.warehouse_jdbc_props["user"])
-                      .option("password", self.warehouse_jdbc_props["password"])
-                      .option("driver", self.warehouse_jdbc_props["driver"])
-                      .load())
-
-            # Read dim_customers to get user_id
-            dim_customers = (self.spark.read
-                            .format("jdbc")
-                            .option("url", self.warehouse_jdbc_url)
-                            .option("dbtable", "(SELECT customer_id, user_id FROM dim_customers) as dim_cust")
-                            .option("user", self.warehouse_jdbc_props["user"])
-                            .option("password", self.warehouse_jdbc_props["password"])
-                            .option("driver", self.warehouse_jdbc_props["driver"])
-                            .load())
-
-            # Join to get user_id (left join, then filter NULLs)
-            events_with_customers = cart_df.join(dim_customers, "customer_id", "left")
-
-            # Filter out any rows where user_id or cart_value is null
-            events_with_customers = events_with_customers.filter(
-                col("user_id").isNotNull() & col("cart_value").isNotNull()
-            )
-
-            # Rename cart_value to total_amount and event_timestamp to transaction_timestamp for compatibility
-            events_with_customers = (events_with_customers
-                .withColumnRenamed("cart_value", "total_amount")
-                .withColumnRenamed("event_timestamp", "transaction_timestamp"))
-
-            count = events_with_customers.count()
-            self.logger.info(f"Extracted {count} cart checkout events for RFM analysis")
-
-            return events_with_customers
-
-        except Exception as e:
-            self.logger.error(f"Error extracting cart checkout data: {e}")
-            raise
-
-    def analyze(self, df: DataFrame) -> DataFrame:
+    def calculate_rfm_scores(self, df: DataFrame) -> DataFrame:
         """
-        Perform RFM analysis on customer transaction data
+        Calculate RFM scores (1-5) for each metric
 
-        Algorithm:
-        1. Calculate RFM metrics per customer
-           - Recency: Days since last transaction
-           - Frequency: Count of transactions
-           - Monetary: Sum of revenue
-        2. Score using quintiles (1-5 scale)
-        3. Create composite RFM score (111-555)
-        4. Classify into segments (Champions, Loyal, etc.)
+        Args:
+            df: DataFrame with recency, frequency, monetary values
+
+        Returns:
+            DataFrame: RFM data with scores
         """
-        self.logger.info("Performing RFM analysis")
+        # Calculate quintiles for scoring (1-5)
+        # Lower recency is better (scored in reverse)
+        # Higher frequency is better
+        # Higher monetary is better
 
-        if df.count() == 0:
-            self.logger.warning("No sales data available for RFM analysis")
-            return self.spark.createDataFrame([], """
-                user_id STRING,
-                analysis_date DATE,
-                recency_days INT,
-                frequency_count BIGINT,
-                monetary_value DOUBLE,
-                recency_score INT,
-                frequency_score INT,
-                monetary_score INT,
-                rfm_score INT,
-                rfm_segment STRING
-            """)
-
-        # Step 1: Calculate RFM metrics per customer
-        self.logger.info("Step 1: Calculating RFM metrics")
-
-        rfm_metrics = df.groupBy("user_id").agg(
-            # Recency: Days since last transaction
-            datediff(current_date(), spark_max("transaction_timestamp")).alias("recency_days"),
-
-            # Frequency: Total number of transactions
-            count("transaction_timestamp").alias("frequency_count"),
-
-            # Monetary: Total revenue (use total_amount, not total_revenue)
-            spark_sum("total_amount").alias("monetary_value")
+        rfm_with_scores = df.select(
+            col("user_id"),
+            col("analysis_date"),
+            col("recency_days"),
+            col("frequency_count"),
+            col("monetary_value"),
+            # Recency score (reverse: lower days = higher score)
+            when(col("recency_days") <= 30, 5)
+            .when(col("recency_days") <= 60, 4)
+            .when(col("recency_days") <= 90, 3)
+            .when(col("recency_days") <= 180, 2)
+            .otherwise(1).alias("recency_score"),
+            # Frequency score
+            when(col("frequency_count") >= 10, 5)
+            .when(col("frequency_count") >= 7, 4)
+            .when(col("frequency_count") >= 4, 3)
+            .when(col("frequency_count") >= 2, 2)
+            .otherwise(1).alias("frequency_score"),
+            # Monetary score
+            when(col("monetary_value") >= 1000, 5)
+            .when(col("monetary_value") >= 500, 4)
+            .when(col("monetary_value") >= 250, 3)
+            .when(col("monetary_value") >= 100, 2)
+            .otherwise(1).alias("monetary_score")
         )
 
-        # Step 2: Calculate quintile-based scores (1-5)
-        self.logger.info("Step 2: Calculating RFM scores using quintiles")
-
-        # Define windows for ntile calculation
-        recency_window = Window.orderBy(col("recency_days").desc())  # Recent = 5, Old = 1
-        frequency_window = Window.orderBy(col("frequency_count").asc())  # Many = 5, Few = 1
-        monetary_window = Window.orderBy(col("monetary_value").asc())  # High = 5, Low = 1
-
-        rfm_scored = rfm_metrics.withColumn(
-            "recency_score",
-            ntile(5).over(recency_window)
-        ).withColumn(
-            "frequency_score",
-            ntile(5).over(frequency_window)
-        ).withColumn(
-            "monetary_score",
-            ntile(5).over(monetary_window)
-        )
-
-        # Step 3: Create composite RFM score
-        self.logger.info("Step 3: Creating composite RFM scores")
-
-        rfm_scored = rfm_scored.withColumn(
+        # Calculate combined RFM score
+        rfm_final = rfm_with_scores.withColumn(
             "rfm_score",
-            (col("recency_score") * 100) + (col("frequency_score") * 10) + col("monetary_score")
+            col("recency_score") * 100 + col("frequency_score") * 10 + col("monetary_score")
         )
 
-        # Step 4: Segment classification
-        self.logger.info("Step 4: Classifying customers into segments")
-
-        rfm_segmented = rfm_scored.withColumn(
+        # Assign RFM segments
+        rfm_final = rfm_final.withColumn(
             "rfm_segment",
-            when(col("rfm_score") >= 544, "Champions")  # 555, 554, 545, 544
-            .when(col("rfm_score") >= 434, "Loyal Customers")  # 543-434
-            .when(col("rfm_score") >= 334, "Potential Loyalists")  # 433-334
-            .when(col("rfm_score") >= 244, "At Risk")  # 333-244
-            .when(col("rfm_score") >= 144, "Need Attention")  # 243-144
-            .otherwise("Lost Customers")  # 143-111
-        ).withColumn(
-            "analysis_date", current_date()
+            when((col("recency_score") >= 4) & (col("frequency_score") >= 4) & (col("monetary_score") >= 4), "Champions")
+            .when((col("recency_score") >= 3) & (col("frequency_score") >= 3), "Loyal Customers")
+            .when((col("recency_score") >= 4) & (col("frequency_score") <= 2), "Promising")
+            .when((col("recency_score") >= 3) & (col("monetary_score") >= 4), "Big Spenders")
+            .when((col("recency_score") <= 2) & (col("frequency_score") >= 3), "At Risk")
+            .when((col("recency_score") <= 2) & (col("frequency_score") <= 2), "Lost")
+            .otherwise("Regular")
         )
 
-        # Log segment distribution
-        segment_counts = rfm_segmented.groupBy("rfm_segment").count().collect()
-        self.logger.info("RFM Segment Distribution:")
-        for row in segment_counts:
-            self.logger.info(f"  {row['rfm_segment']}: {row['count']} customers")
+        return rfm_final
 
-        return rfm_segmented
+    def execute(self) -> None:
+        """Execute RFM analysis"""
+        print("Executing RFM Analysis...")
+        print(f"Analysis date: {self.analysis_date}")
+        print()
 
-    def load(self, df: DataFrame) -> None:
-        """
-        Load RFM analysis results to warehouse
-        Truncates and reloads the table (full refresh)
-        """
-        self.logger.info("Loading RFM analysis results to warehouse")
-
-        if df.count() == 0:
-            self.logger.warning("No RFM results to load")
-            return
-
-        # Select columns for target table
-        columns_to_insert = [
-            "user_id", "analysis_date",
-            "recency_days", "frequency_count", "monetary_value",
-            "recency_score", "frequency_score", "monetary_score",
-            "rfm_score", "rfm_segment"
-        ]
-
-        df_to_load = df.select(columns_to_insert)
+        # Read fact_sales data
+        print("Reading fact_sales data...")
 
         try:
-            # Truncate existing data (full refresh approach)
-            self.logger.info("Truncating existing RFM analysis data")
-            with self.connection.get_warehouse_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("TRUNCATE TABLE rfm_analysis")
-                    conn.commit()
-
-            # Load new analysis results
-            (df_to_load.write
-             .format("jdbc")
-             .option("url", self.warehouse_jdbc_url)
-             .option("dbtable", "rfm_analysis")
-             .option("user", self.warehouse_jdbc_props["user"])
-             .option("password", self.warehouse_jdbc_props["password"])
-             .option("driver", self.warehouse_jdbc_props["driver"])
-             .mode("append")
-             .save())
-
-            self.stats["rows_inserted"] = df_to_load.count()
-            self.logger.info(f"Loaded {self.stats['rows_inserted']} RFM analysis records")
-
-            # Update customer dimension with RFM scores
-            self.update_customer_dimension(df)
-
-        except Exception as e:
-            self.logger.error(f"Error loading RFM analysis results: {e}")
-            raise
-
-    def update_customer_dimension(self, rfm_df: DataFrame) -> None:
-        """
-        Update customer dimension with RFM segment and score
-        This triggers SCD Type 2 changes for customers whose segment changed
-        """
-        self.logger.info("Updating customer dimension with RFM scores")
-
-        try:
-            # Get current customer dimension
-            dim_customers = (self.spark.read
-                           .format("jdbc")
-                           .option("url", self.warehouse_jdbc_url)
-                           .option("dbtable", "(SELECT user_id, customer_segment, rfm_score FROM dim_customers) as dim_cust")
-                           .option("user", self.warehouse_jdbc_props["user"])
-                           .option("password", self.warehouse_jdbc_props["password"])
-                           .option("driver", self.warehouse_jdbc_props["driver"])
-                           .load())
-
-            # Join with RFM results to find changes
-            updates = rfm_df.alias("rfm").join(
-                dim_customers.alias("dim"),
-                col("rfm.user_id") == col("dim.user_id"),
-                "inner"
-            ).filter(
-                (col("rfm.rfm_segment") != col("dim.customer_segment")) |
-                (col("rfm.rfm_score") != col("dim.rfm_score"))
-            ).select(
-                col("rfm.user_id"),
-                col("rfm.rfm_segment"),
-                col("rfm.rfm_score").cast("int")
+            fact_sales = self.read_from_warehouse(table_name="fact_sales")
+            # Filter in Spark
+            fact_sales = fact_sales.filter(
+                (col("transaction_timestamp").isNotNull()) &
+                (col("customer_id").isNotNull())
             )
 
-            update_count = updates.count()
+            if fact_sales.count() == 0:
+                print("No sales data found in warehouse")
+                print("Skipping RFM analysis")
+                return
 
-            if update_count > 0:
-                self.logger.info(f"Found {update_count} customers with changed RFM segments")
+            print(f"✓ Loaded {fact_sales.count()} sales records")
+            print()
 
-                # Collect updates to apply via SQL
-                updates_list = updates.collect()
+            # Calculate RFM metrics
+            print("Calculating RFM metrics...")
 
-                with self.connection.get_warehouse_connection() as conn:
-                    with conn.cursor() as cursor:
-                        for row in updates_list:
-                            # Update customer record with new RFM data
-                            cursor.execute("""
-                                UPDATE dim_customers
-                                SET customer_segment = %s,
-                                    rfm_score = %s,
-                                    updated_at = CURRENT_TIMESTAMP
-                                WHERE user_id = %s
-                            """, (
-                                row["rfm_segment"],
-                                row["rfm_score"],
-                                row["user_id"]
-                            ))
+            # Group by customer and calculate RFM
+            rfm_metrics = fact_sales.groupBy("customer_id").agg(
+                datediff(lit(self.analysis_date), spark_max("transaction_timestamp")).alias("recency_days"),
+                count("transaction_id").alias("frequency_count"),
+                spark_sum("total_amount").alias("monetary_value")
+            ).withColumn(
+                "user_id",
+                expr("CONCAT('user_', customer_id)")
+            ).withColumn(
+                "analysis_date",
+                lit(self.analysis_date).cast("date")
+            )
 
-                        conn.commit()
+            print(f"✓ Calculated RFM for {rfm_metrics.count()} customers")
+            print()
 
-                self.logger.info(f"Updated {update_count} customer dimension records with new RFM segments")
-            else:
-                self.logger.info("No customer segment changes detected")
+            # Calculate RFM scores
+            print("Assigning RFM scores and segments...")
+            rfm_scored = self.calculate_rfm_scores(rfm_metrics)
+
+            # Select final columns
+            rfm_final = rfm_scored.select(
+                "user_id",
+                "analysis_date",
+                "recency_days",
+                "frequency_count",
+                "monetary_value",
+                "recency_score",
+                "frequency_score",
+                "monetary_score",
+                "rfm_score",
+                "rfm_segment"
+            )
+
+            print(f"✓ Scored {rfm_final.count()} customers")
+            print()
+
+            # Show segment distribution
+            print("RFM Segment Distribution:")
+            rfm_final.groupBy("rfm_segment").count().orderBy(col("count").desc()).show()
+
+            # Load to warehouse
+            # Delete existing records for this analysis_date to ensure idempotency
+            print("Loading RFM analysis to warehouse...")
+
+            # First, delete existing records for this analysis date
+            import psycopg2
+            from config.settings import settings
+
+            conn = psycopg2.connect(
+                host=settings.postgres_warehouse.host,
+                port=settings.postgres_warehouse.port,
+                database=settings.postgres_warehouse.database,
+                user=settings.postgres_warehouse.user,
+                password=settings.postgres_warehouse.password
+            )
+
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM rfm_analysis WHERE analysis_date = %s",
+                    (self.analysis_date,)
+                )
+                deleted_count = cursor.rowcount
+                conn.commit()
+                if deleted_count > 0:
+                    print(f"  Deleted {deleted_count} existing records for {self.analysis_date}")
+                cursor.close()
+            finally:
+                conn.close()
+
+            # Now insert new records
+            self.write_to_warehouse(rfm_final, "rfm_analysis", mode="append")
+            print(f"✓ Loaded RFM analysis results")
 
         except Exception as e:
-            self.logger.warning(f"Could not update customer dimension: {e}")
-            self.logger.info("RFM analysis completed successfully despite dimension update issue")
+            print(f"Error during RFM analysis: {str(e)}")
+            print("This may be normal if no sales data exists yet")
+            raise e
+
+
+if __name__ == "__main__":
+    # Run RFM Analysis
+    job = RFMAnalysisJob()
+    job.run()

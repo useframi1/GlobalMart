@@ -39,19 +39,24 @@ CREATE INDEX idx_dim_date_year_month ON dim_date(year, month);
 
 CREATE TABLE dim_geography (
     geography_id SERIAL PRIMARY KEY,
-    country VARCHAR(100) NOT NULL UNIQUE,
+    country VARCHAR(100) NOT NULL,
     region VARCHAR(100),
     continent VARCHAR(50),
     currency VARCHAR(10),
     timezone VARCHAR(50),
+    effective_start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    effective_end_date TIMESTAMP DEFAULT '9999-12-31 23:59:59' NOT NULL,
+    is_current BOOLEAN DEFAULT TRUE NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_dim_geography_country ON dim_geography(country);
+CREATE INDEX idx_dim_geography_current ON dim_geography(country, is_current);
+CREATE INDEX idx_dim_geography_effective ON dim_geography(effective_start_date, effective_end_date);
 
 CREATE TABLE dim_customers (
     customer_id SERIAL PRIMARY KEY,
-    user_id VARCHAR(100) NOT NULL UNIQUE,
+    user_id VARCHAR(100) NOT NULL,
     first_transaction_date DATE,
     last_transaction_date DATE,
     total_transactions BIGINT DEFAULT 0,
@@ -60,16 +65,21 @@ CREATE TABLE dim_customers (
     customer_segment VARCHAR(50),
     rfm_score INTEGER,
     is_active BOOLEAN DEFAULT TRUE,
+    effective_start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    effective_end_date TIMESTAMP DEFAULT '9999-12-31 23:59:59' NOT NULL,
+    is_current BOOLEAN DEFAULT TRUE NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_dim_customers_user_id ON dim_customers(user_id);
 CREATE INDEX idx_dim_customers_segment ON dim_customers(customer_segment);
+CREATE INDEX idx_dim_customers_current ON dim_customers(user_id, is_current);
+CREATE INDEX idx_dim_customers_effective ON dim_customers(effective_start_date, effective_end_date);
 
 CREATE TABLE dim_products (
     product_id_pk SERIAL PRIMARY KEY,
-    product_id VARCHAR(100) NOT NULL UNIQUE,
+    product_id VARCHAR(100) NOT NULL,
     product_name VARCHAR(255),
     category VARCHAR(100),
     subcategory VARCHAR(100),
@@ -77,12 +87,17 @@ CREATE TABLE dim_products (
     cost DOUBLE PRECISION,
     margin DOUBLE PRECISION,
     is_active BOOLEAN DEFAULT TRUE,
+    effective_start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    effective_end_date TIMESTAMP DEFAULT '9999-12-31 23:59:59' NOT NULL,
+    is_current BOOLEAN DEFAULT TRUE NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_dim_products_product_id ON dim_products(product_id);
 CREATE INDEX idx_dim_products_category ON dim_products(category);
+CREATE INDEX idx_dim_products_current ON dim_products(product_id, is_current);
+CREATE INDEX idx_dim_products_effective ON dim_products(effective_start_date, effective_end_date);
 
 -- ================== FACT TABLES ==================
 

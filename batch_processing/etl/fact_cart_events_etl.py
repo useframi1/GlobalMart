@@ -1,208 +1,122 @@
 """
-Cart Events Fact ETL with Incremental Loading
-Loads cart interaction events from real-time database
+Fact Cart Events ETL
+Populates fact_cart_events table with cart events
 """
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, lit, current_timestamp, when, concat, monotonically_increasing_id
-from datetime import datetime
 import sys
 import os
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, lit
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from batch_processing.etl.base_etl import FactETL
+from batch_processing.etl.base_etl import BaseETL
 
 
-class CartEventsFactETL(FactETL):
-    """ETL for cart events fact table with incremental loading"""
+class FactCartEventsETL(BaseETL):
+    """ETL job for populating fact_cart_events fact table"""
 
-    def __init__(self, spark):
-        super().__init__(spark, "fact_cart_events")
+    def __init__(self):
+        super().__init__("FactCartEvents")
 
     def extract(self) -> DataFrame:
         """
-        Extract cart event data from real-time database
-        Uses incremental loading based on last run timestamp
+        Extract cart events from real-time database
+
+        Returns:
+            DataFrame: Raw cart events
         """
-        self.logger.info("Extracting cart events from real-time database")
+        # Read from cart_events table in realtime DB
+        df = self.read_from_postgres(table_name="cart_events", database="realtime")
 
-        # Get last load timestamp for incremental processing
-        last_load = self.get_last_load_timestamp()
+        print(f"  Extracted {df.count()} cart events")
 
-        if last_load is None:
-            # First run - load all historical data
-            self.logger.info("First run - loading all historical cart events")
-            where_clause = "1=1"
-        else:
-            # Incremental load - only new data
-            self.logger.info(f"Incremental load - data since {last_load}")
-            where_clause = f"window_start > '{last_load}'"
-
-        try:
-            # Extract from cart_sessions table
-            # Contains aggregated cart metrics per session window
-            query = f"""
-                (SELECT
-                    window_start as event_timestamp,
-                    session_id,
-                    user_id,
-                    country,
-                    add_count + remove_count + update_count + checkout_count as total_events,
-                    max_cart_value,
-                    checkout_count > 0 as is_checkout,
-                    last_activity,
-                    created_at
-                FROM cart_sessions
-                WHERE {where_clause}) as cart_data
-            """
-
-            df = (self.spark.read
-                  .format("jdbc")
-                  .option("url", self.realtime_jdbc_url)
-                  .option("dbtable", query)
-                  .option("user", self.realtime_jdbc_props["user"])
-                  .option("password", self.realtime_jdbc_props["password"])
-                  .option("driver", self.realtime_jdbc_props["driver"])
-                  .load())
-
-            self.stats["rows_processed"] = df.count()
-            self.logger.info(f"Extracted {self.stats['rows_processed']} cart event records")
-
-            return df
-
-        except Exception as e:
-            self.logger.error(f"Error extracting cart events: {e}")
-            # Return empty DataFrame with correct schema
-            return self.spark.createDataFrame([], """
-                event_timestamp TIMESTAMP,
-                session_id STRING,
-                user_id STRING,
-                country STRING,
-                total_events BIGINT,
-                max_cart_value DOUBLE,
-                is_checkout BOOLEAN,
-                last_activity TIMESTAMP,
-                total_value DOUBLE,
-                is_abandoned BOOLEAN,
-                session_duration_minutes INTEGER,
-                created_at TIMESTAMP
-            """)
+        return df
 
     def transform(self, df: DataFrame) -> DataFrame:
         """
-        Transform cart event data
-        Add surrogate key lookups and derived metrics
+        Transform cart events to fact table format
+
+        Args:
+            df: Input DataFrame
+
+        Returns:
+            DataFrame: Transformed fact records with dimension keys
         """
-        self.logger.info("Transforming cart events fact data")
+        # Read dimension tables for lookups - filter for current records only
+        dim_customers = self.read_from_warehouse(table_name="dim_customers").filter(col("is_current") == True)
+        dim_products = self.read_from_warehouse(table_name="dim_products").filter(col("is_current") == True)
+        dim_geography = self.read_from_warehouse(table_name="dim_geography").filter(col("is_current") == True)
+        dim_date = self.read_from_warehouse(table_name="dim_date")
 
-        if df.count() == 0:
-            self.logger.info("No cart events to transform")
-            return df
+        # Join with dimension tables to get surrogate keys
+        transformed_df = df.alias("c") \
+            .join(dim_customers.select("customer_id", "user_id").alias("cu"),
+                  col("c.user_id") == col("cu.user_id"), "left") \
+            .join(dim_products.select("product_id_pk", "product_id").alias("p"),
+                  col("c.product_id") == col("p.product_id"), "left") \
+            .join(dim_geography.select("geography_id", "country").alias("g"),
+                  col("c.country") == col("g.country"), "left") \
+            .join(dim_date.select("date_id", "date").alias("d"),
+                  col("c.event_timestamp").cast("date") == col("d.date"), "left") \
+            .select(
+                col("c.event_id"),
+                col("d.date_id"),
+                col("cu.customer_id"),
+                col("p.product_id_pk"),
+                col("g.geography_id"),
+                col("c.session_id"),
+                col("c.event_type"),
+                col("c.event_timestamp"),
+                col("c.quantity"),
+                col("c.cart_value")
+            )
 
-        # Read dimension tables to get keys
-        try:
-            # Get customer primary keys
-            dim_customers = (self.spark.read
-                           .format("jdbc")
-                           .option("url", self.warehouse_jdbc_url)
-                           .option("dbtable", "(SELECT customer_id, user_id FROM dim_customers) as dim_cust")
-                           .option("user", self.warehouse_jdbc_props["user"])
-                           .option("password", self.warehouse_jdbc_props["password"])
-                           .option("driver", self.warehouse_jdbc_props["driver"])
-                           .load())
-
-            # Get date keys
-            dim_date = (self.spark.read
-                       .format("jdbc")
-                       .option("url", self.warehouse_jdbc_url)
-                       .option("dbtable", "(SELECT date_id, date FROM dim_date) as dim_dt")
-                       .option("user", self.warehouse_jdbc_props["user"])
-                       .option("password", self.warehouse_jdbc_props["password"])
-                       .option("driver", self.warehouse_jdbc_props["driver"])
-                       .load())
-
-        except Exception as e:
-            self.logger.error(f"Error reading dimension tables: {e}")
-            self.logger.warning("Proceeding without dimension lookups")
-            dim_customers = None
-            dim_date = None
-
-        # Join with dimensions to get keys
-        transformed = df
-
-        if dim_customers is not None:
-            transformed = transformed.join(
-                dim_customers,
-                transformed.user_id == dim_customers.user_id,
-                "left"
-            ).drop(dim_customers.user_id)
-
-        if dim_date is not None:
-            # Join on date
-            transformed = transformed.join(
-                dim_date,
-                col("event_timestamp").cast("date") == col("date"),
-                "left"
-            ).drop("date")
-
-        # Generate unique event_id
-        transformed = transformed.withColumn("event_id",
-            concat(lit("cart_"), col("session_id")))
-        
-        # Add derived metrics
-        transformed = (transformed
-            .withColumn("event_type",
-                when(col("is_checkout") == True, lit("cart_checkout"))
-                .otherwise(lit("cart_event")))
-            .withColumn("cart_value", col("max_cart_value"))
-            .withColumn("session_duration_sec",
-                when(col("last_activity").isNotNull(), lit(0))
-                .otherwise(lit(0)))
-            .withColumn("created_at", current_timestamp())
-            .withColumn("updated_at", current_timestamp())
-        )
-
-        return transformed
+        return transformed_df
 
     def load(self, df: DataFrame) -> None:
         """
-        Load cart events to warehouse
-        Appends new records (facts are immutable)
-        """
-        self.logger.info("Loading cart events fact data to warehouse")
+        Load fact cart events data to warehouse with deduplication
 
+        Args:
+            df: Transformed DataFrame
+        """
         if df.count() == 0:
-            self.logger.info("No cart events to load")
+            print("  No cart events to load for this period")
             return
 
-        # Select only columns that exist in target table
-        columns_to_insert = [
-            "event_id", "event_timestamp", "session_id", "customer_id", "date_id",
-            "event_type", "cart_value"
-        ]
-
-        # Filter to only existing columns
-        available_columns = [c for c in columns_to_insert if c in df.columns]
-        df_to_load = df.select(available_columns)
-
         try:
-            # Append to fact table
-            (df_to_load.write
-             .format("jdbc")
-             .option("url", self.warehouse_jdbc_url)
-             .option("dbtable", "fact_cart_events")
-             .option("user", self.warehouse_jdbc_props["user"])
-             .option("password", self.warehouse_jdbc_props["password"])
-             .option("driver", self.warehouse_jdbc_props["driver"])
-             .mode("append")
-             .save())
+            # Read existing cart events to check for duplicates
+            existing_events = self.read_from_warehouse("fact_cart_events")
+            existing_event_ids = existing_events.select("event_id").distinct()
 
-            self.stats["rows_inserted"] = df_to_load.count()
-            self.stats["rows_updated"] = 0  # Facts are immutable
+            # Filter out records that already exist (based on event_id)
+            new_events = df.join(
+                existing_event_ids,
+                df.event_id == existing_event_ids.event_id,
+                "left_anti"
+            )
 
-            self.logger.info(f"Loaded {self.stats['rows_inserted']} cart event records to warehouse")
+            new_count = new_events.count()
+            duplicate_count = df.count() - new_count
+
+            if duplicate_count > 0:
+                print(f"  Skipping {duplicate_count} duplicate records")
+
+            if new_count > 0:
+                self.write_to_warehouse(new_events, "fact_cart_events", mode="append")
+                print(f"  Loaded {new_count} new cart events to fact_cart_events")
+            else:
+                print("  No new cart events to load (all records already exist)")
 
         except Exception as e:
-            self.logger.error(f"Error loading cart events: {e}")
-            raise
+            # If table doesn't exist yet or other error, load all records
+            print(f"  Note: {str(e)}")
+            print(f"  Loading all {df.count()} records to fact_cart_events")
+            self.write_to_warehouse(df, "fact_cart_events", mode="append")
+
+
+if __name__ == "__main__":
+    # Run FactCartEvents ETL
+    etl = FactCartEventsETL()
+    etl.run()

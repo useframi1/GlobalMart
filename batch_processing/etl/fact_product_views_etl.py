@@ -1,217 +1,122 @@
 """
-Product Views Fact ETL with Incremental Loading
-Loads product browsing/view events from real-time database
+Fact Product Views ETL
+Populates fact_product_views table with product view events
 """
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, lit, current_timestamp, when, concat, monotonically_increasing_id
-from datetime import datetime
 import sys
 import os
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, lit
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from batch_processing.etl.base_etl import FactETL
+from batch_processing.etl.base_etl import BaseETL
 
 
-class ProductViewsFactETL(FactETL):
-    """ETL for product views fact table with incremental loading"""
+class FactProductViewsETL(BaseETL):
+    """ETL job for populating fact_product_views fact table"""
 
-    def __init__(self, spark):
-        super().__init__(spark, "fact_product_views")
+    def __init__(self):
+        super().__init__("FactProductViews")
 
     def extract(self) -> DataFrame:
         """
-        Extract product view data from real-time database
-        Uses incremental loading based on last run timestamp
+        Extract product view events from real-time database
+
+        Returns:
+            DataFrame: Raw product view events
         """
-        self.logger.info("Extracting product views from real-time database")
+        # Read from product_view_events table in realtime DB
+        df = self.read_from_postgres(table_name="product_view_events", database="realtime")
 
-        # Get last load timestamp for incremental processing
-        last_load = self.get_last_load_timestamp()
+        print(f"  Extracted {df.count()} product view events")
 
-        if last_load is None:
-            # First run - load all historical data
-            self.logger.info("First run - loading all historical product views")
-            where_clause = "1=1"
-        else:
-            # Incremental load - only new data
-            self.logger.info(f"Incremental load - data since {last_load}")
-            where_clause = f"window_start > '{last_load}'"
-
-        try:
-            # Extract from trending_products table
-            # Contains aggregated product view metrics
-            query = f"""
-                (SELECT
-                    window_start as view_timestamp,
-                    product_id,
-                    product_name,
-                    category,
-                    product_price,
-                    view_count,
-                    unique_viewers,
-                    avg_view_duration,
-                    created_at
-                FROM trending_products
-                WHERE {where_clause}) as view_data
-            """
-
-            df = (self.spark.read
-                  .format("jdbc")
-                  .option("url", self.realtime_jdbc_url)
-                  .option("dbtable", query)
-                  .option("user", self.realtime_jdbc_props["user"])
-                  .option("password", self.realtime_jdbc_props["password"])
-                  .option("driver", self.realtime_jdbc_props["driver"])
-                  .load())
-
-            self.stats["rows_processed"] = df.count()
-            self.logger.info(f"Extracted {self.stats['rows_processed']} product view records")
-
-            return df
-
-        except Exception as e:
-            self.logger.error(f"Error extracting product views: {e}")
-            # Return empty DataFrame with correct schema
-            return self.spark.createDataFrame([], """
-                view_timestamp TIMESTAMP,
-                product_id STRING,
-                product_name STRING,
-                category STRING,
-                product_price DOUBLE,
-                view_count BIGINT,
-                unique_viewers BIGINT,
-                avg_view_duration DOUBLE,
-                product_price DOUBLE,
-                view_count BIGINT,
-                click_through_rate DOUBLE,
-                created_at TIMESTAMP
-            """)
+        return df
 
     def transform(self, df: DataFrame) -> DataFrame:
         """
-        Transform product view data
-        Add surrogate key lookups and derived metrics
+        Transform product view events to fact table format
+
+        Args:
+            df: Input DataFrame
+
+        Returns:
+            DataFrame: Transformed fact records with dimension keys
         """
-        self.logger.info("Transforming product views fact data")
+        # Read dimension tables for lookups - filter for current records only
+        dim_customers = self.read_from_warehouse(table_name="dim_customers").filter(col("is_current") == True)
+        dim_products = self.read_from_warehouse(table_name="dim_products").filter(col("is_current") == True)
+        dim_geography = self.read_from_warehouse(table_name="dim_geography").filter(col("is_current") == True)
+        dim_date = self.read_from_warehouse(table_name="dim_date")
 
-        if df.count() == 0:
-            self.logger.info("No product views to transform")
-            return df
+        # Join with dimension tables to get surrogate keys
+        transformed_df = df.alias("v") \
+            .join(dim_customers.select("customer_id", "user_id").alias("c"),
+                  col("v.user_id") == col("c.user_id"), "left") \
+            .join(dim_products.select("product_id_pk", "product_id").alias("p"),
+                  col("v.product_id") == col("p.product_id"), "left") \
+            .join(dim_geography.select("geography_id", "country").alias("g"),
+                  col("v.country") == col("g.country"), "left") \
+            .join(dim_date.select("date_id", "date").alias("d"),
+                  col("v.event_timestamp").cast("date") == col("d.date"), "left") \
+            .select(
+                col("v.event_id"),
+                col("d.date_id"),
+                col("c.customer_id"),
+                col("p.product_id_pk"),
+                col("g.geography_id"),
+                col("v.session_id"),
+                col("v.event_type"),
+                col("v.event_timestamp"),
+                col("v.view_duration"),
+                col("v.search_query")
+            )
 
-        # Read dimension tables to get keys
-        try:
-            # Get product primary keys
-            dim_products = (self.spark.read
-                          .format("jdbc")
-                          .option("url", self.warehouse_jdbc_url)
-                          .option("dbtable", "(SELECT product_id_pk, product_id FROM dim_products) as dim_prod")
-                          .option("user", self.warehouse_jdbc_props["user"])
-                          .option("password", self.warehouse_jdbc_props["password"])
-                          .option("driver", self.warehouse_jdbc_props["driver"])
-                          .load())
-
-            # Get date keys
-            dim_date = (self.spark.read
-                       .format("jdbc")
-                       .option("url", self.warehouse_jdbc_url)
-                       .option("dbtable", "(SELECT date_id, date FROM dim_date) as dim_dt")
-                       .option("user", self.warehouse_jdbc_props["user"])
-                       .option("password", self.warehouse_jdbc_props["password"])
-                       .option("driver", self.warehouse_jdbc_props["driver"])
-                       .load())
-
-        except Exception as e:
-            self.logger.error(f"Error reading dimension tables: {e}")
-            self.logger.warning("Proceeding without dimension lookups")
-            dim_products = None
-            dim_date = None
-
-        # Join with dimensions to get keys
-        transformed = df
-
-        if dim_products is not None:
-            # Use broadcast join for better performance
-            transformed = transformed.join(
-                dim_products,
-                transformed.product_id == dim_products.product_id,
-                "left"
-            ).drop(dim_products.product_id)
-
-        if dim_date is not None:
-            # Join on date
-            transformed = transformed.join(
-                dim_date,
-                col("view_timestamp").cast("date") == col("date"),
-                "left"
-            ).drop("date")
-
-        # Add default session_id if not present 
-        if "session_id" not in transformed.columns:
-            transformed = transformed.withColumn("session_id", 
-                concat(lit("view_session_"), monotonically_increasing_id()))
-
-        # Add event_type if not present
-        if "event_type" not in transformed.columns:
-            transformed = transformed.withColumn("event_type", lit("product_view"))
-
-        # Generate unique event_id
-        transformed = transformed.withColumn("event_id",
-            concat(lit("view_"), col("product_id"), lit("_"), monotonically_increasing_id()))
-        
-        transformed = transformed.withColumnRenamed("view_timestamp", "event_timestamp")
-
-        # Add derived metrics
-        transformed = (transformed
-            .withColumn("view_source", lit("web"))  # Would come from event data
-            .withColumn("device_type", lit("desktop"))  # Would come from event data
-            .withColumn("avg_view_duration_sec", col("avg_view_duration"))
-            .withColumn("engagement_score", col("view_count") * col("unique_viewers"))
-            .withColumn("created_at", current_timestamp())
-            .withColumn("updated_at", current_timestamp())
-        )
-
-        return transformed
+        return transformed_df
 
     def load(self, df: DataFrame) -> None:
         """
-        Load product views to warehouse
-        Appends new records (facts are immutable)
-        """
-        self.logger.info("Loading product views fact data to warehouse")
+        Load fact product views data to warehouse with deduplication
 
+        Args:
+            df: Transformed DataFrame
+        """
         if df.count() == 0:
-            self.logger.info("No product views to load")
+            print("  No product view events to load for this period")
             return
 
-        # Select only columns that exist in target table
-        columns_to_insert = [
-            "event_id", "event_timestamp", "session_id", "event_type",
-            "product_id_pk", "date_id"
-        ]
-
-        # Filter to only existing columns
-        available_columns = [c for c in columns_to_insert if c in df.columns]
-        df_to_load = df.select(available_columns)
-
         try:
-            # Append to fact table
-            (df_to_load.write
-             .format("jdbc")
-             .option("url", self.warehouse_jdbc_url)
-             .option("dbtable", "fact_product_views")
-             .option("user", self.warehouse_jdbc_props["user"])
-             .option("password", self.warehouse_jdbc_props["password"])
-             .option("driver", self.warehouse_jdbc_props["driver"])
-             .mode("append")
-             .save())
+            # Read existing product views to check for duplicates
+            existing_views = self.read_from_warehouse("fact_product_views")
+            existing_event_ids = existing_views.select("event_id").distinct()
 
-            self.stats["rows_inserted"] = df_to_load.count()
-            self.stats["rows_updated"] = 0  # Facts are immutable
+            # Filter out records that already exist (based on event_id)
+            new_views = df.join(
+                existing_event_ids,
+                df.event_id == existing_event_ids.event_id,
+                "left_anti"
+            )
 
-            self.logger.info(f"Loaded {self.stats['rows_inserted']} product view records to warehouse")
+            new_count = new_views.count()
+            duplicate_count = df.count() - new_count
+
+            if duplicate_count > 0:
+                print(f"  Skipping {duplicate_count} duplicate records")
+
+            if new_count > 0:
+                self.write_to_warehouse(new_views, "fact_product_views", mode="append")
+                print(f"  Loaded {new_count} new product view events to fact_product_views")
+            else:
+                print("  No new product view events to load (all records already exist)")
 
         except Exception as e:
-            self.logger.error(f"Error loading product views: {e}")
-            raise
+            # If table doesn't exist yet or other error, load all records
+            print(f"  Note: {str(e)}")
+            print(f"  Loading all {df.count()} records to fact_product_views")
+            self.write_to_warehouse(df, "fact_product_views", mode="append")
+
+
+if __name__ == "__main__":
+    # Run FactProductViews ETL
+    etl = FactProductViewsETL()
+    etl.run()

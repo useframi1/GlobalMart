@@ -1,106 +1,128 @@
 """
-Base Analytics Job Class
-Abstract base class for all analytics jobs
+Base Batch Job Class
+Provides common functionality for all batch analytics jobs
 """
-from abc import ABC, abstractmethod
-from pyspark.sql import SparkSession, DataFrame
-from datetime import datetime
 import sys
 import os
+from abc import ABC, abstractmethod
+from datetime import datetime
+from pyspark.sql import DataFrame, SparkSession
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from batch_processing.warehouse.connection import db_connection
-from batch_processing.utils.logging_config import get_logger
+from config.settings import settings
+from batch_processing.warehouse.spark_batch import create_batch_spark_session
 
 
-class BaseAnalyticsJob(ABC):
-    """Abstract base class for analytics jobs"""
+class BaseBatchJob(ABC):
+    """Base class for all batch analytics jobs"""
 
-    def __init__(self, spark: SparkSession, job_name: str):
-        self.spark = spark
+    def __init__(self, job_name: str):
+        """
+        Initialize base batch job
+
+        Args:
+            job_name: Name of the batch job
+        """
         self.job_name = job_name
-        self.logger = get_logger(job_name)
-        self.connection = db_connection
-
-        # JDBC configurations
-        self.warehouse_jdbc_url = self.connection.get_warehouse_jdbc_url()
-        self.warehouse_jdbc_props = self.connection.get_warehouse_jdbc_properties()
-
+        self.spark = create_batch_spark_session(f"GlobalMart-Batch-{job_name}")
         self.start_time = None
-        self.stats = {
-            "rows_processed": 0,
-            "rows_inserted": 0,
-            "rows_updated": 0,
-            "execution_duration_sec": 0
+        self.end_time = None
+
+    @abstractmethod
+    def execute(self) -> None:
+        """Execute the batch analytics job"""
+        pass
+
+    def read_from_warehouse(self, table_name: str, query: str = None) -> DataFrame:
+        """
+        Read data from warehouse PostgreSQL
+
+        Args:
+            table_name: Table name to read from
+            query: Optional SQL query (overrides table_name)
+
+        Returns:
+            DataFrame: Data from warehouse
+        """
+        jdbc_options = {
+            "url": settings.postgres_warehouse.jdbc_url,
+            "user": settings.postgres_warehouse.user,
+            "password": settings.postgres_warehouse.password,
+            "driver": "org.postgresql.Driver"
         }
 
-    @abstractmethod
-    def extract(self) -> DataFrame:
-        """
-        Extract data from warehouse for analysis
+        if query:
+            jdbc_options["query"] = query
+        else:
+            jdbc_options["dbtable"] = table_name
 
-        Returns:
-            DataFrame: Source data for analysis
-        """
-        pass
+        df = self.spark.read.format("jdbc").options(**jdbc_options).load()
 
-    @abstractmethod
-    def analyze(self, df: DataFrame) -> DataFrame:
-        """
-        Perform analytics calculations
+        return df
 
-        Args:
-            df: Input DataFrame
-
-        Returns:
-            DataFrame: Analysis results
+    def write_to_warehouse(
+        self,
+        df: DataFrame,
+        table_name: str,
+        mode: str = "overwrite"
+    ) -> None:
         """
-        pass
-
-    @abstractmethod
-    def load(self, df: DataFrame) -> None:
-        """
-        Load analysis results to warehouse
+        Write DataFrame to warehouse PostgreSQL
 
         Args:
-            df: Analysis results DataFrame
+            df: DataFrame to write
+            table_name: Target table name
+            mode: Write mode ('append', 'overwrite', 'ignore')
         """
-        pass
+        jdbc_url = settings.postgres_warehouse.jdbc_url
+        properties = {
+            "user": settings.postgres_warehouse.user,
+            "password": settings.postgres_warehouse.password,
+            "driver": "org.postgresql.Driver"
+        }
 
-    def run(self) -> dict:
-        """
-        Execute analytics job with error handling
+        df.write.jdbc(
+            url=jdbc_url,
+            table=table_name,
+            mode=mode,
+            properties=properties
+        )
 
-        Returns:
-            dict: Execution statistics
-        """
+    def run(self) -> None:
+        """Execute the complete batch job"""
+        print("=" * 60)
+        print(f"Batch Job: {self.job_name}")
+        print("=" * 60)
+        print(f"Started at: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        print()
+
         self.start_time = datetime.utcnow()
 
         try:
-            self.logger.info(f"Starting analytics job: {self.job_name}")
+            # Execute job logic
+            self.execute()
 
-            # Analytics Steps
-            self.logger.info("Step 1: Extract data from warehouse")
-            source_df = self.extract()
+            self.end_time = datetime.utcnow()
+            duration = (self.end_time - self.start_time).total_seconds()
 
-            self.logger.info("Step 2: Perform analysis")
-            results_df = self.analyze(source_df)
-
-            self.logger.info("Step 3: Load results")
-            self.load(results_df)
-
-            # Calculate duration
-            end_time = datetime.utcnow()
-            self.stats["execution_duration_sec"] = int((end_time - self.start_time).total_seconds())
-
-            self.logger.info(f"Analytics job completed: {self.job_name}")
-            self.logger.info(f"Statistics: {self.stats}")
-
-            return self.stats
+            print()
+            print("=" * 60)
+            print(f"Batch Job Completed: {self.job_name}")
+            print(f"Duration: {duration:.2f} seconds")
+            print(f"Completed at: {self.end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            print("=" * 60)
+            print()
 
         except Exception as e:
-            self.logger.error(f"Analytics job failed: {self.job_name}")
-            self.logger.error(f"Error: {str(e)}", exc_info=True)
-            raise
+            print(f"\n✗ Batch Job Failed: {self.job_name}")
+            print(f"Error: {str(e)}")
+            raise e
+
+        finally:
+            self.spark.stop()
+
+
+if __name__ == "__main__":
+    print("Base Batch Job class - Use this as a parent for specific analytics jobs")

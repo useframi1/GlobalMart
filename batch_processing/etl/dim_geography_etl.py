@@ -1,100 +1,87 @@
 """
-Geography Dimension ETL
-Static dimension with country reference data
+Dimension Geography ETL
+Populates dim_geography table with country/region data
 """
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import lit
 import sys
 import os
+from pyspark.sql import DataFrame
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from config.constants import COUNTRIES
-from batch_processing.etl.base_etl import DimensionETL
+from batch_processing.etl.base_etl import BaseETL
 
 
-class GeographyDimensionETL(DimensionETL):
-    """ETL for geography dimension - static reference data"""
+class DimGeographyETL(BaseETL):
+    """ETL job for populating dim_geography dimension table"""
 
-    def __init__(self, spark):
-        super().__init__(spark, "dim_geography", use_scd2=False)
+    def __init__(self):
+        super().__init__("DimGeography")
 
     def extract(self) -> DataFrame:
-        """Create geography data from constants"""
-        self.logger.info("Extracting geography data from constants")
+        """
+        Extract geography data from constants
 
-        # Geography mapping
+        Returns:
+            DataFrame: Geography data
+        """
+        # Geography mapping (country, region, continent, currency, timezone)
         geography_data = [
-            ("USA", "North America", "Americas", "USD", "America/New_York"),
-            ("UK", "Western Europe", "Europe", "GBP", "Europe/London"),
-            ("Germany", "Western Europe", "Europe", "EUR", "Europe/Berlin"),
-            ("France", "Western Europe", "Europe", "EUR", "Europe/Paris"),
-            ("Japan", "East Asia", "Asia", "JPY", "Asia/Tokyo")
+            ('USA', 'North America', 'Americas', 'USD', 'America/New_York'),
+            ('UK', 'Western Europe', 'Europe', 'GBP', 'Europe/London'),
+            ('Germany', 'Western Europe', 'Europe', 'EUR', 'Europe/Berlin'),
+            ('France', 'Western Europe', 'Europe', 'EUR', 'Europe/Paris'),
+            ('Japan', 'East Asia', 'Asia', 'JPY', 'Asia/Tokyo')
         ]
 
+        # Create DataFrame using createDataFrame (works with Spark 3.4.0)
         df = self.spark.createDataFrame(
             geography_data,
             ["country", "region", "continent", "currency", "timezone"]
         )
 
-        self.stats["rows_processed"] = df.count()
         return df
 
     def transform(self, df: DataFrame) -> DataFrame:
-        """No transformation needed for static data"""
-        self.logger.info("Transforming geography dimension")
-        return df
+        """
+        Transform geography data with SCD Type 2 columns
+
+        Args:
+            df: Input DataFrame
+
+        Returns:
+            DataFrame: Transformed DataFrame with SCD Type 2 columns
+        """
+        from pyspark.sql.functions import current_timestamp, lit
+
+        # Add SCD Type 2 columns
+        transformed_df = df.select(
+            "*",
+            current_timestamp().alias("effective_start_date"),
+            lit("9999-12-31 23:59:59").cast("timestamp").alias("effective_end_date"),
+            lit(True).alias("is_current")
+        )
+
+        return transformed_df
 
     def load(self, df: DataFrame) -> None:
-        """Load to warehouse (insert if not exists)"""
-        self.logger.info("Loading geography dimension")
+        """
+        Load geography dimension to warehouse using SCD Type 2
 
-        try:
-            # Check existing countries
-            existing_df = (self.spark.read
-                          .format("jdbc")
-                          .option("url", self.warehouse_jdbc_url)
-                          .option("dbtable", "dim_geography")
-                          .option("user", self.warehouse_jdbc_props["user"])
-                          .option("password", self.warehouse_jdbc_props["password"])
-                          .option("driver", self.warehouse_jdbc_props["driver"])
-                          .load())
+        Args:
+            df: Transformed DataFrame
+        """
+        self.write_to_warehouse(
+            df,
+            "dim_geography",
+            mode="append",
+            scd_type2=True,
+            natural_key="country"
+        )
+        print(f"  Loaded {df.count()} geography records to dim_geography")
 
-            existing_countries = [row.country for row in existing_df.select("country").collect()]
 
-            # Insert only new countries
-            new_countries_df = df.filter(~df.country.isin(existing_countries))
-
-            insert_count = new_countries_df.count()
-
-            if insert_count > 0:
-                (new_countries_df.write
-                 .format("jdbc")
-                 .option("url", self.warehouse_jdbc_url)
-                 .option("dbtable", "dim_geography")
-                 .option("user", self.warehouse_jdbc_props["user"])
-                 .option("password", self.warehouse_jdbc_props["password"])
-                 .option("driver", self.warehouse_jdbc_props["driver"])
-                 .mode("append")
-                 .save())
-
-                self.stats["rows_inserted"] = insert_count
-                self.logger.info(f"Inserted {insert_count} new geographies")
-            else:
-                self.logger.info("No new geographies to insert")
-
-        except Exception:
-            # Table is empty
-            (df.write
-             .format("jdbc")
-             .option("url", self.warehouse_jdbc_url)
-             .option("dbtable", "dim_geography")
-             .option("user", self.warehouse_jdbc_props["user"])
-             .option("password", self.warehouse_jdbc_props["password"])
-             .option("driver", self.warehouse_jdbc_props["driver"])
-             .mode("append")
-             .save())
-
-            self.stats["rows_inserted"] = df.count()
-            self.logger.info(f"Inserted {self.stats['rows_inserted']} geographies")
+if __name__ == "__main__":
+    # Run DimGeography ETL
+    etl = DimGeographyETL()
+    etl.run()

@@ -16,6 +16,9 @@ from stream_processing.jobs.cart_analyzer import CartAnalyzer
 from stream_processing.jobs.product_view_analyzer import ProductViewAnalyzer
 from stream_processing.jobs.anomaly_detector import AnomalyDetector
 from stream_processing.jobs.inventory_tracker import InventoryTracker
+from stream_processing.jobs.transaction_saver import TransactionSaver
+from stream_processing.jobs.product_view_saver import ProductViewSaver
+from stream_processing.jobs.cart_event_saver import CartEventSaver
 
 
 class StreamProcessingOrchestrator:
@@ -129,7 +132,7 @@ def main():
     parser.add_argument(
         "--jobs",
         nargs="+",
-        choices=["sales", "cart", "product_views", "anomaly", "inventory", "all"],
+        choices=["sales", "cart", "product_views", "anomaly", "inventory", "transactions", "product_view_events", "cart_events", "all"],
         default=["all"],
         help="Jobs to run (default: all)"
     )
@@ -154,6 +157,9 @@ def main():
     orchestrator.register_job("product_views", ProductViewAnalyzer())
     orchestrator.register_job("anomaly", AnomalyDetector())
     orchestrator.register_job("inventory", InventoryTracker())
+    orchestrator.register_job("transactions", TransactionSaver())
+    orchestrator.register_job("product_view_events", ProductViewSaver())
+    orchestrator.register_job("cart_events", CartEventSaver())
 
     print()
 

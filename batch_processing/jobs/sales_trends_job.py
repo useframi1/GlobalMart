@@ -1,316 +1,219 @@
 """
-Sales Trends Analysis Job
-Analyzes sales patterns across time and geography
+Sales Trends Analysis Batch Job
+Analyzes sales trends by time period and category
 """
-from pyspark.sql import DataFrame
-from pyspark.sql.functions import (
-    col, count, sum as spark_sum, avg, max as spark_max, min as spark_min,
-    current_date, current_timestamp, lag, when, lit
-)
-from pyspark.sql.window import Window
-from datetime import datetime
 import sys
 import os
+from datetime import datetime
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import (
+    col, count, sum as spark_sum, avg, year, month, quarter, weekofyear,
+    date_format, lit, lag, when
+)
+from pyspark.sql.window import Window
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from batch_processing.jobs.base_job import BaseAnalyticsJob
+from batch_processing.jobs.base_job import BaseBatchJob
 
 
-class SalesTrendsJob(BaseAnalyticsJob):
-    """
-    Sales Trends Analysis Job
+class SalesTrendsJob(BaseBatchJob):
+    """Sales Trends Analysis job"""
 
-    Analyzes sales trends by:
-    - Time dimensions (day, week, month, quarter)
-    - Geographic dimensions (country, region)
-    - Category performance over time
-    - Growth rates and comparisons
-    """
-
-    def __init__(self, spark):
-        super().__init__(spark, "sales_trends")
-
-    def extract(self) -> DataFrame:
+    def __init__(self, analysis_date: str = None):
         """
-        Extract sales data from warehouse
-        Join fact_sales with dimensions to get all needed attributes
+        Initialize Sales Trends Analysis job
+
+        Args:
+            analysis_date: Date of analysis (YYYY-MM-DD), defaults to today
         """
-        self.logger.info("Extracting sales data from data warehouse")
+        super().__init__("Sales_Trends")
+        self.analysis_date = analysis_date or datetime.utcnow().strftime("%Y-%m-%d")
 
-        try:
-            # Read fact_sales
-            sales_df = (self.spark.read
-                       .format("jdbc")
-                       .option("url", self.warehouse_jdbc_url)
-                       .option("dbtable", "fact_sales")
-                       .option("user", self.warehouse_jdbc_props["user"])
-                       .option("password", self.warehouse_jdbc_props["password"])
-                       .option("driver", self.warehouse_jdbc_props["driver"])
-                       .load())
-
-            # Read dim_products
-            dim_products = (self.spark.read
-                           .format("jdbc")
-                           .option("url", self.warehouse_jdbc_url)
-                           .option("dbtable", "(SELECT product_id_pk, product_id, category FROM dim_products) as dim_prod")
-                           .option("user", self.warehouse_jdbc_props["user"])
-                           .option("password", self.warehouse_jdbc_props["password"])
-                           .option("driver", self.warehouse_jdbc_props["driver"])
-                           .load())
-
-            # Read dim_date
-            dim_date = (self.spark.read
-                       .format("jdbc")
-                       .option("url", self.warehouse_jdbc_url)
-                       .option("dbtable", "(SELECT date_id, date, year, quarter, month, month_name, week, day_of_week, day_name, is_weekend FROM dim_date) as dim_dt")
-                       .option("user", self.warehouse_jdbc_props["user"])
-                       .option("password", self.warehouse_jdbc_props["password"])
-                       .option("driver", self.warehouse_jdbc_props["driver"])
-                       .load())
-
-            # Read dim_customers (for user_id if needed)
-            dim_customers = (self.spark.read
-                            .format("jdbc")
-                            .option("url", self.warehouse_jdbc_url)
-                            .option("dbtable", "(SELECT customer_id, user_id FROM dim_customers) as dim_cust")
-                            .option("user", self.warehouse_jdbc_props["user"])
-                            .option("password", self.warehouse_jdbc_props["password"])
-                            .option("driver", self.warehouse_jdbc_props["driver"])
-                            .load())
-
-            # Join all dimensions
-            sales_with_dims = (sales_df
-                              .join(dim_products, "product_id_pk", "left")
-                              .join(dim_date, "date_id", "left")
-                              .join(dim_customers, "customer_id", "left"))
-
-            # Rename columns and select what we need
-            result_df = sales_with_dims.select(
-                col("transaction_timestamp"),
-                col("product_id"),
-                col("category"),
-                col("total_amount").alias("total_revenue"),
-                col("quantity"),
-                col("date").alias("full_date"),
-                col("year"),
-                col("quarter"),
-                col("month"),
-                col("month_name"),
-                col("week"),
-                col("day_of_week"),
-                col("day_name"),
-                col("is_weekend"),
-                col("user_id")
-            )
-
-            count = result_df.count()
-            self.logger.info(f"Extracted {count} sales records for trends analysis")
-
-            return result_df
-
-        except Exception as e:
-            self.logger.error(f"Error extracting sales trends data: {e}")
-            raise
-
-    def analyze(self, df: DataFrame) -> DataFrame:
+    def calculate_trends(
+        self,
+        df: DataFrame,
+        period_type: str,
+        period_col: str
+    ) -> DataFrame:
         """
-        Perform sales trends analysis
+        Calculate sales trends for a time period
 
-        Creates multiple aggregation levels:
-        - Daily trends by country and category
-        - Weekly/Monthly/Quarterly aggregations
-        - Growth rate calculations
+        Args:
+            df: Input sales DataFrame
+            period_type: Type of period (daily, weekly, monthly, quarterly, yearly)
+            period_col: Column containing the period value
+
+        Returns:
+            DataFrame: Trend analysis results
         """
-        self.logger.info("Performing sales trends analysis")
-
-        if df.count() == 0:
-            self.logger.warning("No sales data available for trends analysis")
-            return self.spark.createDataFrame([], """
-                period_type STRING,
-                period_value STRING,
-                category STRING,
-                total_sales BIGINT,
-                total_revenue DOUBLE,
-                avg_order_value DOUBLE,
-                total_quantity BIGINT,
-                growth_rate DOUBLE,
-                analysis_date DATE
-            """)
-
-        # Filter out rows with NULL date dimensions BEFORE any groupBy operations
-        self.logger.info("Filtering out NULL date dimensions and categories")
-        df_clean = df.filter(
-            col("year").isNotNull() &
-            col("quarter").isNotNull() &
-            col("month").isNotNull() &
-            col("week").isNotNull() &
-            col("full_date").isNotNull() &
-            col("category").isNotNull()
+        # Aggregate by period and category
+        trend_data = df.groupBy(period_col, "category").agg(
+            count("*").alias("total_sales"),
+            spark_sum("total_amount").alias("total_revenue"),
+            avg("total_amount").alias("avg_order_value"),
+            spark_sum("quantity").alias("total_quantity")
+        ).withColumn(
+            "period_type",
+            lit(period_type)
+        ).withColumnRenamed(
+            period_col,
+            "period_value"
+        ).withColumn(
+            "analysis_date",
+            lit(self.analysis_date).cast("date")
         )
 
-        clean_count = df_clean.count()
-        self.logger.info(f"Cleaned data: {clean_count} records with complete date dimensions")
-
-        if clean_count == 0:
-            self.logger.warning("No data with complete date dimensions available")
-            return self.spark.createDataFrame([], """
-                period_type STRING,
-                period_value STRING,
-                category STRING,
-                total_sales BIGINT,
-                total_revenue DOUBLE,
-                avg_order_value DOUBLE,
-                total_quantity BIGINT,
-                growth_rate DOUBLE,
-                analysis_date DATE
-            """)
-
-        # For trends, we'll use category instead of country since we don't have geography in fact_sales
-        # Step 1: Daily trends
-        self.logger.info("Step 1: Calculating daily trends")
-
-        daily_trends = df_clean.groupBy(
-            "full_date", "year", "quarter", "month", "week", "category"
-        ).agg(
-            count("*").alias("total_sales"),
-            spark_sum("total_revenue").alias("total_revenue"),
-            avg("total_revenue").alias("avg_order_value"),
-            spark_sum("quantity").alias("total_quantity")
-        ).withColumn("period_type", lit("daily"))\
-         .withColumn("period_value", col("full_date").cast("string"))
-
-        # Step 2: Weekly trends
-        self.logger.info("Step 2: Calculating weekly trends")
-
-        weekly_trends = df_clean.groupBy(
-            "year", "week", "category"
-        ).agg(
-            count("*").alias("total_sales"),
-            spark_sum("total_revenue").alias("total_revenue"),
-            avg("total_revenue").alias("avg_order_value"),
-            spark_sum("quantity").alias("total_quantity")
-        ).withColumn("period_type", lit("weekly"))\
-         .withColumn("period_value",
-                    when(col("week") < 10,
-                         col("year").cast("string") + "-W0" + col("week").cast("string"))
-                    .otherwise(col("year").cast("string") + "-W" + col("week").cast("string")))\
-         .withColumn("quarter", lit(None).cast("int"))\
-         .withColumn("month", lit(None).cast("int"))\
-         .withColumn("full_date", lit(None).cast("date"))
-
-        # Step 3: Monthly trends
-        self.logger.info("Step 3: Calculating monthly trends")
-
-        monthly_trends = df_clean.groupBy(
-            "year", "quarter", "month", "category"
-        ).agg(
-            count("*").alias("total_sales"),
-            spark_sum("total_revenue").alias("total_revenue"),
-            avg("total_revenue").alias("avg_order_value"),
-            spark_sum("quantity").alias("total_quantity")
-        ).withColumn("period_type", lit("monthly"))\
-         .withColumn("period_value",
-                    when(col("month") < 10,
-                         col("year").cast("string") + "-0" + col("month").cast("string"))
-                    .otherwise(col("year").cast("string") + "-" + col("month").cast("string")))\
-         .withColumn("week", lit(None).cast("int"))\
-         .withColumn("full_date", lit(None).cast("date"))
-
-        # Step 4: Quarterly trends
-        self.logger.info("Step 4: Calculating quarterly trends")
-
-        quarterly_trends = df_clean.groupBy(
-            "year", "quarter", "category"
-        ).agg(
-            count("*").alias("total_sales"),
-            spark_sum("total_revenue").alias("total_revenue"),
-            avg("total_revenue").alias("avg_order_value"),
-            spark_sum("quantity").alias("total_quantity")
-        ).withColumn("period_type", lit("quarterly"))\
-         .withColumn("period_value", col("year").cast("string") + "-Q" + col("quarter").cast("string"))\
-         .withColumn("month", lit(None).cast("int"))\
-         .withColumn("week", lit(None).cast("int"))\
-         .withColumn("full_date", lit(None).cast("date"))
-
-        # Step 5: Union all trends
-        self.logger.info("Step 5: Combining all trend levels")
-
-        all_trends = daily_trends.unionByName(weekly_trends, allowMissingColumns=True)\
-                                 .unionByName(monthly_trends, allowMissingColumns=True)\
-                                 .unionByName(quarterly_trends, allowMissingColumns=True)
-
-        # Step 6: Calculate growth rates (period-over-period)
-        self.logger.info("Step 6: Calculating growth rates")
-
-        # Window for lag calculation (by period type, category)
-        window_spec = Window.partitionBy("period_type", "category")\
-                            .orderBy("period_value")
-
-        trends_with_growth = all_trends.withColumn(
-            "prev_revenue", lag("total_revenue", 1).over(window_spec)
+        # Calculate growth rate (vs previous period)
+        window_spec = Window.partitionBy("category").orderBy("period_value")
+        trend_with_growth = trend_data.withColumn(
+            "prev_revenue",
+            lag("total_revenue", 1).over(window_spec)
         ).withColumn(
             "growth_rate",
-            when(col("prev_revenue").isNotNull() & (col("prev_revenue") > 0),
-                 ((col("total_revenue") - col("prev_revenue")) / col("prev_revenue") * 100))
-            .otherwise(0.0)
-        ).drop("prev_revenue")\
-         .withColumn("analysis_date", current_date())
+            when(col("prev_revenue").isNotNull(),
+                 ((col("total_revenue") - col("prev_revenue")) / col("prev_revenue")) * 100
+            ).otherwise(None)
+        ).drop("prev_revenue")
 
-        # Select final columns and filter out any NULLs in critical fields
-        final_trends = trends_with_growth.select(
-            "period_type", "period_value", "category",
-            "total_sales", "total_revenue",
-            "avg_order_value", "total_quantity",
-            "growth_rate", "analysis_date"
-        ).filter(
-            col("period_type").isNotNull() &
-            col("period_value").isNotNull() &
-            col("category").isNotNull()
+        # Cast period_value to string for consistency
+        trend_final = trend_with_growth.withColumn(
+            "period_value",
+            col("period_value").cast("string")
         )
 
-        # Log some statistics
-        trend_counts = final_trends.groupBy("period_type").count().collect()
-        self.logger.info("Sales Trends by Period Type:")
-        for row in trend_counts:
-            self.logger.info(f"  {row['period_type']}: {row['count']} records")
+        return trend_final
 
-        return final_trends
+    def execute(self) -> None:
+        """Execute sales trends analysis"""
+        print("Executing Sales Trends Analysis...")
+        print(f"Analysis date: {self.analysis_date}")
+        print()
 
-    def load(self, df: DataFrame) -> None:
-        """
-        Load sales trends results to warehouse
-        Truncates and reloads the table (full refresh)
-        """
-        self.logger.info("Loading sales trends results to warehouse")
-
-        if df.count() == 0:
-            self.logger.warning("No sales trends results to load")
-            return
+        # Read sales data with product info
+        print("Reading sales data...")
 
         try:
-            # Truncate existing data
-            self.logger.info("Truncating existing sales trends data")
-            with self.connection.get_warehouse_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("TRUNCATE TABLE sales_trends")
-                    conn.commit()
+            # Read both tables
+            fact_sales = self.read_from_warehouse(table_name="fact_sales")
+            # Filter for current products only (SCD Type 2)
+            dim_products = self.read_from_warehouse(table_name="dim_products").filter(col("is_current") == True)
 
-            # Load new analysis results
-            (df.write
-             .format("jdbc")
-             .option("url", self.warehouse_jdbc_url)
-             .option("dbtable", "sales_trends")
-             .option("user", self.warehouse_jdbc_props["user"])
-             .option("password", self.warehouse_jdbc_props["password"])
-             .option("driver", self.warehouse_jdbc_props["driver"])
-             .mode("append")
-             .save())
+            # Join and filter in Spark
+            sales_df = fact_sales.join(
+                dim_products,
+                fact_sales.product_id_pk == dim_products.product_id_pk,
+                "left"
+            ).select(
+                fact_sales.transaction_timestamp,
+                fact_sales.total_amount,
+                fact_sales.quantity,
+                fact_sales.product_id_pk,
+                dim_products.category
+            ).filter(col("transaction_timestamp").isNotNull())
 
-            self.stats["rows_inserted"] = df.count()
-            self.logger.info(f"Loaded {self.stats['rows_inserted']} sales trends records")
+            if sales_df.count() == 0:
+                print("No sales data found")
+                print("Skipping sales trends analysis")
+                return
+
+            print(f"✓ Loaded {sales_df.count()} sales records")
+            print()
+
+            # Add time period columns
+            sales_with_periods = sales_df.select(
+                "*",
+                year("transaction_timestamp").alias("year_period"),
+                quarter("transaction_timestamp").alias("quarter_period"),
+                date_format("transaction_timestamp", "yyyy-MM").alias("month_period"),
+                weekofyear("transaction_timestamp").alias("week_period"),
+                date_format("transaction_timestamp", "yyyy-MM-dd").alias("day_period")
+            )
+
+            # Calculate trends for different periods
+            all_trends = []
+
+            print("Calculating monthly trends...")
+            monthly_trends = self.calculate_trends(sales_with_periods, "monthly", "month_period")
+            all_trends.append(monthly_trends)
+            print(f"✓ Calculated {monthly_trends.count()} monthly trend records")
+
+            print("Calculating weekly trends...")
+            weekly_trends = self.calculate_trends(sales_with_periods, "weekly", "week_period")
+            all_trends.append(weekly_trends)
+            print(f"✓ Calculated {weekly_trends.count()} weekly trend records")
+
+            print("Calculating quarterly trends...")
+            quarterly_trends = self.calculate_trends(sales_with_periods, "quarterly", "quarter_period")
+            all_trends.append(quarterly_trends)
+            print(f"✓ Calculated {quarterly_trends.count()} quarterly trend records")
+
+            # Combine all trends
+            combined_trends = all_trends[0]
+            for trend_df in all_trends[1:]:
+                combined_trends = combined_trends.union(trend_df)
+
+            print(f"\n✓ Total trend records: {combined_trends.count()}")
+            print()
+
+            # Select final columns
+            trends_final = combined_trends.select(
+                "period_type",
+                "period_value",
+                "category",
+                "total_sales",
+                "total_revenue",
+                "avg_order_value",
+                "total_quantity",
+                "growth_rate",
+                "analysis_date"
+            )
+
+            # Show sample trends
+            print("Sample Trends (Top 10 by revenue):")
+            trends_final.orderBy(col("total_revenue").desc()).show(10, truncate=False)
+
+            # Load to warehouse
+            # Delete existing records for this analysis_date to ensure idempotency
+            print("Loading sales trends to warehouse...")
+
+            # First, delete existing records for this analysis date
+            import psycopg2
+            from config.settings import settings
+
+            conn = psycopg2.connect(
+                host=settings.postgres_warehouse.host,
+                port=settings.postgres_warehouse.port,
+                database=settings.postgres_warehouse.database,
+                user=settings.postgres_warehouse.user,
+                password=settings.postgres_warehouse.password
+            )
+
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM sales_trends WHERE analysis_date = %s",
+                    (self.analysis_date,)
+                )
+                deleted_count = cursor.rowcount
+                conn.commit()
+                if deleted_count > 0:
+                    print(f"  Deleted {deleted_count} existing records for {self.analysis_date}")
+                cursor.close()
+            finally:
+                conn.close()
+
+            # Now insert new records
+            self.write_to_warehouse(trends_final, "sales_trends", mode="append")
+            print("✓ Loaded sales trends results")
 
         except Exception as e:
-            self.logger.error(f"Error loading sales trends results: {e}")
-            raise
+            print(f"Error during sales trends analysis: {str(e)}")
+            raise e
+
+
+if __name__ == "__main__":
+    # Run Sales Trends Analysis
+    job = SalesTrendsJob()
+    job.run()

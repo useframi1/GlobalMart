@@ -2,6 +2,7 @@
 Centralized configuration management for GlobalMart.
 Loads configuration from environment variables using .env file.
 """
+
 import os
 from pathlib import Path
 from typing import List
@@ -20,13 +21,21 @@ class KafkaConfig:
     def __init__(self):
         self.bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
         self.zookeeper_connect = os.getenv("KAFKA_ZOOKEEPER_CONNECT", "localhost:2181")
-        self.topic_transactions = os.getenv("KAFKA_TOPIC_TRANSACTIONS", "transactions-topic")
-        self.topic_cart_events = os.getenv("KAFKA_TOPIC_CART_EVENTS", "cart-events-topic")
-        self.topic_product_views = os.getenv("KAFKA_TOPIC_PRODUCT_VIEWS", "product-views-topic")
+        self.topic_transactions = os.getenv(
+            "KAFKA_TOPIC_TRANSACTIONS", "transactions-topic"
+        )
+        self.topic_cart_events = os.getenv(
+            "KAFKA_TOPIC_CART_EVENTS", "cart-events-topic"
+        )
+        self.topic_product_views = os.getenv(
+            "KAFKA_TOPIC_PRODUCT_VIEWS", "product-views-topic"
+        )
         self.topic_alerts = os.getenv("KAFKA_TOPIC_ALERTS", "alerts-topic")
         self.num_partitions = int(os.getenv("KAFKA_NUM_PARTITIONS", "3"))
         self.replication_factor = int(os.getenv("KAFKA_REPLICATION_FACTOR", "1"))
-        self.auto_create_topics = os.getenv("KAFKA_AUTO_CREATE_TOPICS", "true").lower() == "true"
+        self.auto_create_topics = (
+            os.getenv("KAFKA_AUTO_CREATE_TOPICS", "true").lower() == "true"
+        )
 
 
 class SparkConfig:
@@ -39,7 +48,9 @@ class SparkConfig:
         self.executor_memory = os.getenv("SPARK_EXECUTOR_MEMORY", "2g")
         self.executor_cores = int(os.getenv("SPARK_EXECUTOR_CORES", "2"))
         self.log_level = os.getenv("SPARK_LOG_LEVEL", "WARN")
-        self.streaming_batch_interval = int(os.getenv("SPARK_STREAMING_BATCH_INTERVAL", "10"))
+        self.streaming_batch_interval = int(
+            os.getenv("SPARK_STREAMING_BATCH_INTERVAL", "10")
+        )
         self.checkpoint_dir = os.getenv("SPARK_CHECKPOINT_DIR", "./data/checkpoints")
 
 
@@ -138,7 +149,9 @@ class DataGenerationConfig:
         self.num_products = int(os.getenv("DATA_GEN_NUM_PRODUCTS", "1000"))
         self.num_categories = int(os.getenv("DATA_GEN_NUM_CATEGORIES", "100"))
         self.num_countries = int(os.getenv("DATA_GEN_NUM_COUNTRIES", "5"))
-        self.enable_validation = os.getenv("DATA_GEN_ENABLE_VALIDATION", "true").lower() == "true"
+        self.enable_validation = (
+            os.getenv("DATA_GEN_ENABLE_VALIDATION", "true").lower() == "true"
+        )
 
 
 class MonitoringConfig:
@@ -180,87 +193,13 @@ class BusinessRulesConfig:
 
     def __init__(self):
         self.low_stock_threshold = int(os.getenv("INVENTORY_LOW_STOCK_THRESHOLD", "10"))
-        self.anomaly_z_score_threshold = float(os.getenv("ANOMALY_DETECTION_Z_SCORE_THRESHOLD", "3.0"))
+        self.anomaly_z_score_threshold = float(
+            os.getenv("ANOMALY_DETECTION_Z_SCORE_THRESHOLD", "3.0")
+        )
         self.session_timeout_minutes = int(os.getenv("SESSION_TIMEOUT_MINUTES", "30"))
-        self.cart_abandonment_timeout_minutes = int(os.getenv("CART_ABANDONMENT_TIMEOUT_MINUTES", "60"))
-
-
-class BatchProcessingConfig:
-    """Batch processing configuration settings"""
-
-    def __init__(self):
-        # Logging configuration
-        self.log_dir = PROJECT_ROOT / "logs" / "batch"
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.log_level = os.getenv("BATCH_LOG_LEVEL", "INFO")
-        self.log_retention_days = int(os.getenv("BATCH_LOG_RETENTION_DAYS", "30"))
-        
-        # Spark configuration for batch processing
-        self.spark_app_name = os.getenv("BATCH_SPARK_APP_NAME", "GlobalMart-BatchProcessing")
-        self.spark_master = os.getenv("BATCH_SPARK_MASTER", "local[*]")
-        self.spark_memory = os.getenv("BATCH_SPARK_MEMORY", "4g")
-        self.spark_cores = os.getenv("BATCH_SPARK_CORES", "4")
-        
-        # Job execution configuration
-        self.max_retries = int(os.getenv("BATCH_MAX_RETRIES", "3"))
-        self.retry_delay_seconds = int(os.getenv("BATCH_RETRY_DELAY_SECONDS", "60"))
-        self.job_timeout_seconds = int(os.getenv("BATCH_JOB_TIMEOUT_SECONDS", "3600"))
-        
-        # Scheduling
-        self.cron_schedule = os.getenv("BATCH_CRON_SCHEDULE", "0 2 * * *")
-        self.cron_schedule_description = os.getenv("BATCH_CRON_SCHEDULE_DESCRIPTION", "Daily at 2:00 AM UTC")
-        
-        # Job dependencies (defines execution order)
-        self.job_dependencies = {
-            # Dimension ETL jobs (no dependencies, can run in parallel)
-            "dim_date": [],
-            "dim_geography": [],
-            "dim_customers": [],
-            "dim_products": [],
-
-            # Fact ETL jobs (depend on dimensions)
-            "fact_sales": ["dim_date", "dim_geography", "dim_customers", "dim_products"],
-            "fact_cart_events": ["dim_date", "dim_customers"],
-            "fact_product_views": ["dim_date", "dim_products"],
-
-            # Analytics jobs (depend on facts and dimensions)
-            "rfm_analysis": ["fact_sales", "dim_customers"],
-            "product_performance": ["fact_sales", "fact_product_views", "dim_products"],
-            "sales_trends": ["fact_sales", "dim_date", "dim_customers"],
-            "customer_segments": ["rfm_analysis", "dim_customers"],
-        }
-        
-        # Job groups for easier execution
-        self.job_groups = {
-            "dimensions": ["dim_date", "dim_geography", "dim_customers", "dim_products"],
-            "facts": ["fact_sales", "fact_cart_events", "fact_product_views"],
-            "analytics": ["rfm_analysis", "product_performance", "sales_trends", "customer_segments"],
-            "all": [
-                # Dimensions first
-                "dim_date", "dim_geography", "dim_customers", "dim_products",
-                # Then facts
-                "fact_sales", "fact_cart_events", "fact_product_views",
-                # Finally analytics
-                "rfm_analysis", "product_performance", "sales_trends", "customer_segments"
-            ]
-        }
-        
-        # Convenience attributes (uppercase for backward compatibility)
-        self.PROJECT_ROOT = PROJECT_ROOT
-        self.LOG_DIR = self.log_dir
-        self.LOG_LEVEL = self.log_level
-        self.LOG_RETENTION_DAYS = self.log_retention_days
-        self.SPARK_APP_NAME = self.spark_app_name
-        self.SPARK_MASTER = self.spark_master
-        self.SPARK_MEMORY = self.spark_memory
-        self.SPARK_CORES = self.spark_cores
-        self.MAX_RETRIES = self.max_retries
-        self.RETRY_DELAY_SECONDS = self.retry_delay_seconds
-        self.JOB_TIMEOUT_SECONDS = self.job_timeout_seconds
-        self.CRON_SCHEDULE = self.cron_schedule
-        self.CRON_SCHEDULE_DESCRIPTION = self.cron_schedule_description
-        self.JOB_DEPENDENCIES = self.job_dependencies
-        self.JOB_GROUPS = self.job_groups
+        self.cart_abandonment_timeout_minutes = int(
+            os.getenv("CART_ABANDONMENT_TIMEOUT_MINUTES", "60")
+        )
 
 
 class Settings:
@@ -280,7 +219,6 @@ class Settings:
         self.alert = AlertConfig()
         self.logging = LoggingConfig()
         self.business_rules = BusinessRulesConfig()
-        self.batch = BatchProcessingConfig()
 
 
 # Global settings instance
